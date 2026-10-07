@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# 第三方大目录（运行时/模型权重约 15.5GB，不入库；仅保留我改过的 api_v2.py）
+GPT-SoVITS/*
+!GPT-SoVITS/api_v2.py
+napcat/
+
+# 运行时产物 / 缓存 / 用户数据
+bot/media_cache/
+bot/data/
+bot/knowledge/
+bot/temp_audio.*
+*.silk
+*.log
+*.wav
+
+# 编辑器与系统
+.vscode/
+Thumbs.db
+Desktop.ini

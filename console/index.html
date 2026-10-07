@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>达妮娅 · 陪伴系统</title>
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="icon" type="image/png" href="assets/dania_idle.png" />
+    <script src="qwebchannel.js"></script>
+</head>
+<body>
+    <div class="app">
+        <!-- 左侧垂直导航 -->
+        <nav class="sidebar">
+            <div class="nav-top">
+                <button class="nav-btn active" data-page="home" title="首页">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5 12 3l9 6.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9 21v-6h6v6"/></svg>
+                </button>
+                <button class="nav-btn" data-page="collab" title="协作">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                </button>
+                <button class="nav-btn" data-page="memory" title="记忆">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></svg>
+                </button>
+                <button class="nav-btn" data-page="task" title="任务">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+                </button>
+            </div>
+            <div class="nav-bottom">
+                <button class="nav-btn" data-page="launch" title="启动">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                </button>
+                <button class="nav-btn" data-page="settings" title="设置">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                </button>
+            </div>
+        </nav>
+
+        <!-- 主内容区 -->
+        <main class="main">
+            <!-- 顶部状态栏 -->
+            <header class="topbar">
+                <div class="brand">
+                    <span class="brand-cn">达妮娅</span>
+                    <span class="brand-sub">陪伴系统</span>
+                </div>
+                <div class="topbar-right">
+                    <span class="status-dot online"></span>
+                    <span class="status-text">在线</span>
+                    <span class="version">v0.9.7</span>
+                    <div class="win-controls">
+                        <button class="win-btn" id="win-min" title="最小化">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                        </button>
+                        <button class="win-btn" id="win-max" title="最大化">
+                            <svg class="icon-max" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg>
+                            <svg class="icon-restore" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="display:none"><rect x="4" y="8" width="12" height="12" rx="1.5"/><path d="M8 4.5h10A1.5 1.5 0 0 1 19.5 6v10"/></svg>
+                        </button>
+                        <button class="win-btn win-close" id="win-close" title="关闭">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+                        </button>
+                    </div>
+                </div>
+            </header>
+
+            <!-- 首页内容（含对话区） -->
+            <section class="page page-home active" id="page-home">
+                <div class="hero">
+                    <div class="avatar-wrap">
+                        <div class="avatar-glow"></div>
+                        <img src="assets/dania_idle.png" alt="达妮娅" class="avatar" id="hero-avatar" />
+                    </div>
+                    <h1 class="greeting" id="greeting">中午好</h1>
+                    <p class="greeting-sub">今天想一起做点什么？</p>
+
+                    <!-- 输入框 -->
+                    <div class="input-bar">
+                        <span class="input-plus">+</span>
+                        <input type="text" class="chat-input" placeholder="和达妮娅说点什么..." id="chat-input" />
+                        <button class="send-btn" id="send-btn">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 对话消息区（首页内嵌） -->
+                <div class="home-chat-messages" id="chat-messages">
+                    <div class="msg msg-bot">
+                        <div class="msg-avatar"><img src="assets/dania_idle.png" /></div>
+                        <div class="msg-body">
+                            <div class="msg-name"><span class="name-diamond">◇</span>达妮娅</div>
+                            <div class="msg-bubble">你好呀～有什么想和我说的吗？</div>
+                            <div class="msg-actions">
+                                <button class="msg-act act-voice" title="播放语音">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg>
+                                </button>
+                                <button class="msg-act act-copy" title="复制">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 底部双栏卡片 -->
+                <div class="info-grid">
+                    <div class="info-card">
+                        <div class="card-label">当前任务</div>
+                        <div class="card-title" id="task-title">整理陪伴系统灰度骨架</div>
+                        <div class="card-desc" id="task-desc">下一步：确认首页与对话结构</div>
+                    </div>
+                    <div class="info-card">
+                        <div class="card-label">最近记忆</div>
+                        <div class="card-title" id="memory-title">晚间记录</div>
+                        <div class="card-desc" id="memory-desc">你说过喜欢星空，记进了她的记忆里</div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 协作页 -->
+            <section class="page page-collab" id="page-collab">
+                <!-- 当前目标横幅 -->
+                <div class="collab-banner" id="collab-banner">
+                    <div class="banner-left">
+                        <div class="banner-label">当前目标</div>
+                        <div class="banner-goal" id="banner-goal">等待新任务…</div>
+                    </div>
+                    <span class="banner-state idle" id="banner-state">
+                        <span class="state-dot"></span><span id="banner-state-text">空闲</span>
+                    </span>
+                </div>
+
+                <div class="collab-grid">
+                    <!-- 左：协作工作区 -->
+                    <div class="collab-card workspace-card">
+                        <div class="collab-card-title">协作工作区</div>
+                        <div class="ws-status" id="ws-status">
+                            <span class="ws-dot idle"></span>
+                            <div class="ws-status-text">
+                                <div class="ws-status-title" id="ws-status-title">空闲</div>
+                                <div class="ws-status-sub" id="ws-status-sub">发起对话后开始协作</div>
+                            </div>
+                        </div>
+                        <div class="ws-content">
+                            <div class="ws-content-label">当前工作内容</div>
+                            <div class="ws-content-title" id="ws-content-title">—</div>
+                            <div class="ws-content-sub" id="ws-content-sub"></div>
+                        </div>
+                    </div>
+
+                    <!-- 右：协作流 -->
+                    <div class="collab-card flow-card">
+                        <div class="collab-card-title">达妮娅 · 协作流</div>
+                        <div class="flow-list" id="flow-list">
+                            <div class="flow-empty" id="flow-empty">暂无协作任务<br/>对话中触发工具时会在此显示</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 记忆页 -->
+            <section class="page page-memory" id="page-memory">
+                <div class="section-head"><h2>记忆库</h2><span class="section-sub">达妮娅记住的事</span></div>
+                <div class="memory-list">
+                    <div class="memory-item"><span class="mem-tag">偏好</span><span class="mem-text">你喜欢星空，尤其夏天的银河</span><span class="mem-time">今天</span></div>
+                    <div class="memory-item"><span class="mem-tag">日常</span><span class="mem-text">你习惯在深夜工作，作息偏晚</span><span class="mem-time">昨天</span></div>
+                    <div class="memory-item"><span class="mem-tag">对话</span><span class="mem-text">你说达妮娅的声音很温柔</span><span class="mem-time">3天前</span></div>
+                </div>
+            </section>
+
+            <!-- 任务页 -->
+            <section class="page page-task" id="page-task">
+                <div class="section-head"><h2>任务清单</h2><span class="section-sub">当前进行中的任务</span></div>
+                <div class="task-list">
+                    <div class="task-item"><span class="task-check done">✓</span><span class="task-text">整理陪伴系统灰度骨架</span><span class="task-prio prio-high">高</span></div>
+                    <div class="task-item"><span class="task-check">○</span><span class="task-text">确认首页与对话结构</span><span class="task-prio prio-high">高</span></div>
+                    <div class="task-item"><span class="task-check">○</span><span class="task-text">接入语音合成流式播放</span><span class="task-prio prio-mid">中</span></div>
+                    <div class="task-item"><span class="task-check">○</span><span class="task-text">优化 STT 首次加载速度</span><span class="task-prio prio-low">低</span></div>
+                </div>
+            </section>
+
+            <!-- 启动页 -->
+            <section class="page page-launch" id="page-launch">
+                <div class="section-head"><h2>服务状态</h2><span class="section-sub">后台依赖进程</span></div>
+                <div class="service-list">
+                    <div class="service-item"><span class="svc-name">Ollama 推理引擎</span><span class="svc-status running">运行中</span></div>
+                    <div class="service-item"><span class="svc-name">GPT-SoVITS 语音合成</span><span class="svc-status running">运行中</span></div>
+                    <div class="service-item"><span class="svc-name">NapCat 消息桥接</span><span class="svc-status stopped">已停止</span></div>
+                    <div class="service-item"><span class="svc-name">Whisper 语音识别</span><span class="svc-status running">运行中</span></div>
+                </div>
+            </section>
+
+            <!-- 设置页 -->
+            <section class="page page-settings" id="page-settings">
+                <div class="section-head"><h2>设置</h2><span class="section-sub">个性化配置</span></div>
+                <div class="settings-list">
+                    <div class="setting-row"><span class="set-label">角色形象</span><span class="set-value">达妮娅</span></div>
+                    <div class="setting-row"><span class="set-label">默认缩放</span><span class="set-value">0.7x</span></div>
+                    <div class="setting-row"><span class="set-label">语音合成</span><span class="set-value">GPT-SoVITS</span></div>
+                    <div class="setting-row"><span class="set-label">LLM 模型</span><span class="set-value">qwen2.5:7b</span></div>
+                    <div class="setting-row"><span class="set-label">回复长度</span><span class="set-value">简短（1-2句）</span></div>
+                    <div class="setting-row"><span class="set-label">开机自启</span><label class="switch"><input type="checkbox" /><span class="slider"></span></label></div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
