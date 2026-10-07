@@ -58,16 +58,19 @@ pip install -r bot/requirements.txt
 # 2. 启动 Ollama 并拉取模型
 ollama pull qwen2.5:7b
 
-# 3. 启动 GPT-SoVITS api_v2（详见 GPT-SoVITS 官方仓库）
+# 3. 部署 GPT-SoVITS 语音服务
+#    代码: https://github.com/RVC-Boss/GPT-SoVITS
+#    预训练模型: https://huggingface.co/lj1995/GPT-SoVITS
+#               （国内镜像: https://hf-mirror.com/lj1995/GPT-SoVITS）
+#    下载后放入 GPT_SoVITS/pretrained_models/，再启动 api_v2（端口 9880）
 
 # 4. 启动达妮娅终端
 pythonw main.py
 ```
 
-> GPT-SoVITS 目录仅提交了修改过的 `api_v2.py`（/tts 失败时打印完整 traceback），
-> 运行时与预训练模型需从 [GPT-SoVITS 官方仓库](https://github.com/RVC-Boss/GPT-SoVITS) 获取。
-
 ## 说明
 
+- GPT-SoVITS 目录仅提交了修改过的 `api_v2.py`（/tts 失败时打印完整 traceback），
+  运行时与预训练模型需按上方地址自行获取
 - 仓库不包含达妮娅音色权重（单文件超 GitHub 100MB 限制），如需使用音色请联系作者获取
 - `dania.char` 为角色配置文件
