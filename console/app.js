@@ -1,4 +1,4 @@
-// ===== 达妮娅陪伴系统 · 前端逻辑（对接 Python 后端）=====
+// ===== 达妮娅终端 · 前端逻辑（对接 Python 后端）=====
 
 let bridge = null;      // Python 桥接对象
 let chatText = "";      // 当前流式回复累积文本
@@ -49,11 +49,22 @@ function initBridge() {
                 if (bridge.service_updated) bridge.service_updated.connect(onServiceUpdated);
                 if (bridge.tool_event) bridge.tool_event.connect(onToolEvent);
                 if (bridge.log) bridge.log.connect(onLog);
-                if (bridge.reminder_fired) bridge.reminder_fired.connect(showReminder);
+                if (bridge.reminder_fired) {
+                    bridge.reminder_fired.connect(showReminder);
+                    bridge.reminder_fired.connect(loadHomeCards);  // 提醒触发后刷新首页任务卡
+                }
+                if (bridge.emotion_changed) bridge.emotion_changed.connect(setHeroEmotion);
+                if (bridge.voice_playback) bridge.voice_playback.connect(onVoicePlayback);
+                if (bridge.user_message) bridge.user_message.connect(onUserMessage);
+                if (bridge.weather_updated) bridge.weather_updated.connect(onWeatherUpdated);
+                if (bridge.system_updated) bridge.system_updated.connect(renderSystemStatus);
                 console.log("[Console] 桥接已就绪");
                 setConnStatus("已连接", true);
                 refreshServices();
+                loadHomeCards();
+                loadWeather();
                 setupWindowControls();
+                initLive2D();
             });
         } else {
             tries++;
@@ -63,6 +74,7 @@ function initBridge() {
                 console.warn("qt.webChannelTransport 5 秒内未就绪，运行在 mock 模式");
                 setConnStatus("未连接", false);
                 setupMockBridge();
+                loadHomeCards();
             }
         }
     }
@@ -93,12 +105,8 @@ function setupMockBridge() {
         },
         replay_voice: () => { console.log("[mock] replay voice"); },
         copy_text: (t) => { try { navigator.clipboard.writeText(t); } catch (e) { } },
-        get_memories: () => wrap(JSON.stringify([
-            { text: "你喜欢星空，尤其夏天的银河", source: "偏好", time: "今天" },
-            { text: "你习惯在深夜工作，作息偏晚", source: "日常", time: "昨天" },
-        ])),
         get_tasks: () => wrap(JSON.stringify([
-            { text: "整理陪伴系统灰度骨架", done: true, prio: "高" },
+            { text: "整理终端灰度骨架", done: true, prio: "高" },
             { text: "确认首页与对话结构", done: false, prio: "高" },
             { text: "接入语音合成流式播放", done: false, prio: "中" },
         ])),
@@ -113,6 +121,8 @@ function setupMockBridge() {
             { label: "语音合成", value: "GPT-SoVITS", type: "str" },
             { label: "LLM 模型", value: "qwen2.5:7b", type: "str" },
         ])),
+        get_weather: () => wrap("{}"),
+        get_system_status: () => wrap("{}"),
         start_service: () => { },
         stop_service: () => { },
         save_setting: () => { },
@@ -124,7 +134,13 @@ function setupMockBridge() {
         tool_event: { connect: () => { } },
         log: { connect: () => { } },
         reminder_fired: { connect: () => { } },
+        emotion_changed: { connect: () => { } },
+        voice_playback: { connect: () => { } },
+        weather_updated: { connect: () => { } },
+        system_updated: { connect: () => { } },
+        user_message: { connect: () => { } },
     };
+    initLive2D();
 }
 
 // 页面就绪后初始化桥接
@@ -218,13 +234,36 @@ navBtns.forEach(btn => {
         pages.forEach(p => p.classList.remove('active'));
         document.getElementById('page-' + target).classList.add('active');
         // 进入页面时刷新数据
-        if (target === 'memory') loadMemories();
         if (target === 'task') loadTasks();
+        if (target === 'home') loadHomeCards();
+        if (target === 'status') loadSystemStatus();
         if (target === 'launch') refreshServices();
         if (target === 'settings') loadSettings();
         if (target === 'collab') btn.classList.remove('tool-pulse');
     });
 });
+
+// 首页底部卡片点击跳转（复用导航切换逻辑，自动刷新数据）
+document.querySelectorAll('.info-card[data-page]').forEach(card => {
+    card.addEventListener('click', () => {
+        const page = card.dataset.page;
+        const navBtn = document.querySelector('.nav-btn[data-page="' + page + '"]');
+        if (navBtn) navBtn.click();
+    });
+});
+
+// ===== 首页协作卡片同步（展示协作页部分内容） =====
+function syncCollabCard() {
+    const title = document.getElementById('collab-card-title');
+    const desc = document.getElementById('collab-card-desc');
+    if (!title || !desc) return;
+    const goalEl = document.getElementById('banner-goal');
+    const stateEl = document.getElementById('ws-status-title');
+    const goal = (goalEl && goalEl.textContent) || '';
+    const state = (stateEl && stateEl.textContent) || '';
+    title.textContent = (goal && goal !== '等待新任务…') ? goal : '暂无协作';
+    desc.textContent = state || '空闲';
+}
 
 // ===== 问候语 =====
 function updateGreeting() {
@@ -284,9 +323,7 @@ function appendMsg(text, who) {
     msg.className = 'msg msg-' + who;
     if (who === 'bot') {
         msg.innerHTML =
-            '<div class="msg-avatar"><img src="assets/dania_idle.png" /></div>' +
             '<div class="msg-body">' +
-            '<div class="msg-name"><span class="name-diamond">◇</span>达妮娅</div>' +
             '<div class="msg-bubble" id="bot-msg-latest"></div>' +
             '<div class="msg-actions">' +
             '<button class="msg-act act-voice" title="播放语音">' + VOICE_ICON + '</button>' +
@@ -300,6 +337,12 @@ function appendMsg(text, who) {
         box.appendChild(msg);
     }
     box.scrollTop = box.scrollHeight;
+}
+
+// 语音识别出的用户文本 → 回显为用户气泡（与键盘输入一致）
+function onUserMessage(text) {
+    text = (text || '').trim();
+    if (text) appendMsg(text, 'user');
 }
 
 // 定时提醒到点：以达妮娅气泡显示在对话区
@@ -405,6 +448,267 @@ function setBannerState(state, text) {
     document.getElementById('banner-state-text').textContent = text;
 }
 
+// ===== 情绪驱动立绘 =====
+// 细腻情绪 → 头像图片映射（复用现有 5 张立绘资产）
+const EMOTION_IMG = {
+    happy: 'assets/dania_happy.png', love: 'assets/dania_happy.png', shy: 'assets/dania_happy.png',
+    angry: 'assets/dania_idle.png', sad: 'assets/dania_idle.png',
+    surprised: 'assets/dania_thinking.png', thinking: 'assets/dania_thinking.png',
+    sleepy: 'assets/dania_sleeping.png', tired: 'assets/dania_sleeping.png', sleeping: 'assets/dania_sleeping.png',
+    speaking: 'assets/dania_speaking.png',
+    idle: 'assets/dania_idle.png',
+};
+// 细腻情绪 → CSS 动画类（同类情绪共用动画）
+const EMOTION_ANIM = {
+    happy: 'emotion-happy', love: 'emotion-happy', shy: 'emotion-happy',
+    angry: 'emotion-angry',
+    sad: 'emotion-sad',
+    surprised: 'emotion-surprised',
+    thinking: 'emotion-thinking',
+    sleepy: 'emotion-sleepy', tired: 'emotion-sleepy', sleeping: 'emotion-sleepy',
+    speaking: 'emotion-speaking',
+};
+
+function setHeroEmotion(state) {
+    state = (state || 'idle').toLowerCase();
+    const avatar = document.getElementById('hero-avatar');
+    if (!avatar) return;
+    const img = EMOTION_IMG[state] || EMOTION_IMG.idle;
+    if (avatar.getAttribute('src') !== img) avatar.setAttribute('src', img);
+    const wrapEl = avatar.closest('.avatar-wrap');
+    if (wrapEl) {
+        wrapEl.className = wrapEl.className.replace(/\s*emotion-\S+/g, '').trim();
+        const anim = EMOTION_ANIM[state];
+        if (anim) wrapEl.classList.add(anim);
+    }
+    applyL2DEmotion(state);
+}
+
+// ===== Live2D 立绘（pixi-live2d-display；库/模型缺失时自动回退静态头像） =====
+let _l2dModel = null;
+let _l2dReady = false;
+let _l2dSpeaking = false;
+
+function loadScript(src) {
+    return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error('加载失败: ' + src));
+        document.head.appendChild(s);
+    });
+}
+
+async function initLive2D() {
+    if (_l2dReady) return;
+    try {
+        await loadScript('lib/live2dcubismcore.min.js');
+        await loadScript('lib/pixi.min.js');
+        await loadScript('lib/pixi-live2d-display.min.js');
+        if (!window.PIXI || !PIXI.live2d) return;
+        const canvas = document.getElementById('l2d-canvas');
+        if (!canvas) return;
+        const app = new PIXI.Application({
+            view: canvas,
+            width: 200,
+            height: 200,
+            backgroundAlpha: 0,
+            autoDensity: true,
+            resolution: Math.min(window.devicePixelRatio || 1, 2),
+        });
+        const model = await PIXI.live2d.Live2DModel.from('model/hiyori/Hiyori.model3.json');
+        const ow = model.internalModel.originalWidth || model.width;
+        const oh = model.internalModel.originalHeight || model.height;
+        const scale = Math.min(200 / ow, 200 / oh) * 1.25;
+        model.scale.set(scale);
+        model.anchor.set(0.5, 0.5);
+        model.position.set(100, 108);
+        app.stage.addChild(model);
+        _l2dModel = model;
+        _hookL2dMouth(model);
+        _l2dReady = true;
+        // 就绪：隐藏静态头像，放大容器
+        const wrap = document.getElementById('avatar-wrap');
+        if (wrap) wrap.classList.add('l2d-active');
+        const img = document.getElementById('hero-avatar');
+        if (img) img.style.visibility = 'hidden';
+        console.log('[Live2D] 模型加载成功');
+    } catch (e) {
+        console.warn('[Live2D] 初始化失败，继续使用静态头像:', e && e.message);
+    }
+}
+
+// 口型驱动：包一层 motionManager.update，动作更新后写入嘴型参数
+function _hookL2dMouth(model) {
+    try {
+        const internal = model.internalModel;
+        const core = internal.coreModel;
+        const origin = internal.motionManager.update.bind(internal.motionManager);
+        internal.motionManager.update = function (m, now) {
+            const ok = origin(m, now);
+            if (_l2dSpeaking) {
+                const wave = Math.sin(performance.now() / 85) * 0.5 + 0.5;
+                core.setParameterValueById(
+                    'ParamMouthOpenY', 0.12 + wave * 0.7 * (0.55 + Math.random() * 0.45));
+            } else {
+                core.setParameterValueById('ParamMouthOpenY', 0);
+            }
+            return ok;
+        };
+    } catch (e) {
+        console.warn('[Live2D] 口型钩子失败', e);
+    }
+}
+
+// 情绪 → 动作映射（Hiyori 示例模型占位；换达妮娅模型后只需改这张表）
+const L2D_MOTION = {
+    happy: ['Idle', 3], love: ['Idle', 3], shy: ['Idle', 4],
+    angry: ['Idle', 7], sad: ['Idle', 1],
+    surprised: ['TapBody', 0], thinking: ['Idle', 8],
+    sleepy: ['Idle', 5], tired: ['Idle', 5],
+};
+
+function applyL2DEmotion(state) {
+    if (!_l2dReady || !_l2dModel) return;
+    if (state === 'idle' || state === 'speaking') return;
+    const mv = L2D_MOTION[state];
+    if (mv) {
+        try { _l2dModel.motion(mv[0], mv[1], 2); } catch (e) { }
+    }
+}
+
+function onVoicePlayback(playing) {
+    _l2dSpeaking = !!playing;
+}
+
+// ===== 顶栏天气胶囊 =====
+let _wTip = null;
+function _ensureWeatherTip() {
+    if (_wTip) return _wTip;
+    _wTip = document.createElement('div');
+    _wTip.id = 'weather-tip';
+    _wTip.className = 'weather-tip-float';
+    document.body.appendChild(_wTip);
+    const chip = document.getElementById('weather-chip');
+    if (chip) {
+        chip.addEventListener('mouseenter', () => {
+            if (!chip.classList.contains('ready') || !_wTip.textContent) return;
+            const r = chip.getBoundingClientRect();
+            _wTip.style.top = (r.bottom + 8) + 'px';
+            _wTip.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
+            _wTip.style.display = 'block';
+        });
+        chip.addEventListener('mouseleave', () => { _wTip.style.display = 'none'; });
+    }
+    return _wTip;
+}
+
+function renderWeather(d) {
+    const el = document.getElementById('weather-chip');
+    if (!el || !d || d.temp === undefined || d.temp === null) return;
+    el.querySelector('.w-icon').textContent = d.icon || '🌡';
+    el.querySelector('.w-temp').textContent = d.temp + '°';
+    el.querySelector('.w-desc').textContent = d.desc || '';
+    _ensureWeatherTip().textContent = (d.city ? d.city + ' · ' : '') +
+        `体感 ${d.feels}° · 湿度 ${d.humidity}% · 风速 ${d.wind}km/h`;
+    el.classList.add('ready');
+}
+
+function onWeatherUpdated(raw) {
+    try { renderWeather(JSON.parse(raw)); } catch (e) { }
+}
+
+function loadWeather() {
+    if (!bridge || !bridge.get_weather) return;
+    try {
+        Promise.resolve(bridge.get_weather()).then(raw => {
+            try {
+                const d = JSON.parse(raw);
+                if (d && d.temp !== undefined) renderWeather(d);
+            } catch (e) { }
+        }).catch(() => { });
+    } catch (e) { }
+}
+
+// ===== 电脑状态页 =====
+function _barCls(p) { return p >= 85 ? ' hot' : (p >= 60 ? ' warn' : ''); }
+
+function _fmtKb(kb) {
+    if (kb >= 1024 * 1024) return (kb / 1024 / 1024).toFixed(1) + ' MB/s';
+    if (kb >= 1024) return (kb / 1024).toFixed(1) + ' MB/s';
+    return kb.toFixed(0) + ' KB/s';
+}
+
+function renderSystemStatus(raw) {
+    let d;
+    try { d = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) { return; }
+    if (!d || !d.cpu) return;
+    const $ = (id) => document.getElementById(id);
+    if (!$('cpu-percent')) return;
+
+    // CPU
+    const cpuP = Math.round(d.cpu.percent || 0);
+    $('cpu-percent').textContent = cpuP;
+    $('cpu-bar').style.width = cpuP + '%';
+    $('cpu-bar').className = 'st-bar-fill' + _barCls(cpuP);
+    $('cpu-freq').textContent = d.cpu.freq_mhz ? (d.cpu.freq_mhz / 1000).toFixed(1) + ' GHz · ' + d.cpu.count + ' 线程' : '';
+    const coresEl = $('cpu-cores');
+    const cores = d.cpu.cores || [];
+    if (coresEl.childElementCount !== cores.length) {
+        coresEl.innerHTML = cores.map(() => '<div class="core-bar"><div class="core-fill"></div></div>').join('');
+    }
+    coresEl.querySelectorAll('.core-fill').forEach((el, i) => {
+        const p = Math.round(cores[i] || 0);
+        el.style.height = p + '%';
+        el.className = 'core-fill' + _barCls(p).trim();
+    });
+
+    // 内存
+    const mem = d.memory || {};
+    const memP = Math.round(mem.percent || 0);
+    $('mem-percent').textContent = memP;
+    $('mem-bar').style.width = memP + '%';
+    $('mem-bar').className = 'st-bar-fill' + _barCls(memP);
+    $('mem-detail').textContent = (mem.used || 0) + ' / ' + (mem.total || 0) + ' GB';
+    $('swap-detail').textContent = mem.swap_total ?
+        `虚拟内存 ${mem.swap_used} / ${mem.swap_total} GB（${Math.round(mem.swap_percent)}%）` : '';
+
+    // 网络
+    const net = d.net || {};
+    $('net-up').textContent = _fmtKb(net.up_kb || 0);
+    $('net-down').textContent = _fmtKb(net.down_kb || 0);
+    $('net-total').textContent = `累计发送 ${net.total_sent || 0} GB · 接收 ${net.total_recv || 0} GB`;
+
+    // 系统
+    $('sys-uptime').textContent = d.uptime || '--';
+    $('sys-procs').textContent = d.processes || '--';
+    if (d.battery) {
+        $('sys-battery-row').style.display = '';
+        $('sys-battery').textContent = Math.round(d.battery.percent) + '%' +
+            (d.battery.plugged ? '（充电中）' : '');
+    } else {
+        $('sys-battery-row').style.display = 'none';
+    }
+
+    // 磁盘
+    const dl = $('disk-list');
+    dl.innerHTML = (d.disks || []).map(k => {
+        const p = Math.round(k.percent || 0);
+        return '<div class="disk-row">' +
+            '<span class="disk-mount">' + k.mount + '</span>' +
+            '<div class="st-bar disk-bar"><div class="st-bar-fill' + _barCls(p) + '" style="width:' + p + '%"></div></div>' +
+            '<span class="disk-detail">' + k.used + ' / ' + k.total + ' GB</span>' +
+            '</div>';
+    }).join('') || '<div class="st-sub">未检测到磁盘分区</div>';
+}
+
+function loadSystemStatus() {
+    if (!bridge || !bridge.get_system_status) return;
+    try {
+        Promise.resolve(bridge.get_system_status()).then(renderSystemStatus).catch(() => { });
+    } catch (e) { }
+}
+
 function setWorkspace(dotCls, title, sub, contentTitle, contentSub) {
     const dot = document.querySelector('#ws-status .ws-dot');
     dot.className = 'ws-dot ' + dotCls;
@@ -416,6 +720,7 @@ function setWorkspace(dotCls, title, sub, contentTitle, contentSub) {
     if (contentSub !== undefined) {
         document.getElementById('ws-content-sub').textContent = contentSub;
     }
+    syncCollabCard();
 }
 
 function collabBegin(goal) {
@@ -534,29 +839,6 @@ function collabError() {
     setWorkspace('error', '出错了', '达妮娅回复失败', '处理异常', '请检查服务状态后重试');
 }
 
-// ===== 记忆页 =====
-function loadMemories() {
-    if (!bridge || !bridge.get_memories) return;
-    bridge.get_memories().then(raw => {
-        const list = JSON.parse(raw);
-        const container = document.querySelector('.memory-list');
-        container.innerHTML = "";
-        if (Array.isArray(list) && list.length === 0) {
-            container.innerHTML = '<div class="memory-item"><span class="mem-text" style="color:var(--text-dim)">暂无记忆</span></div>';
-            return;
-        }
-        list.forEach(m => {
-            const item = document.createElement('div');
-            item.className = 'memory-item';
-            item.innerHTML = `
-                <span class="mem-tag">${m.source || '记忆'}</span>
-                <span class="mem-text">${m.text}</span>
-                <span class="mem-time">${m.time || ''}</span>`;
-            container.appendChild(item);
-        });
-    });
-}
-
 // ===== 任务页 =====
 function loadTasks() {
     if (!bridge || !bridge.get_tasks) return;
@@ -578,6 +860,27 @@ function loadTasks() {
                 <span class="task-prio ${prioClass}">${t.prio || ''}</span>`;
             container.appendChild(item);
         });
+    });
+}
+
+// ===== 首页信息卡片（真实任务） =====
+function loadHomeCards() {
+    if (!bridge || !bridge.get_tasks) return;
+    bridge.get_tasks().then(raw => {
+        try {
+            const list = JSON.parse(raw);
+            const real = (Array.isArray(list) ? list : []).filter(t => t.text && t.text !== '暂无提醒任务');
+            const tEl = document.getElementById('task-title');
+            const dEl = document.getElementById('task-desc');
+            if (!tEl || !dEl) return;
+            if (real.length > 0) {
+                tEl.textContent = real[0].text;
+                dEl.textContent = real.length > 1 ? `还有 ${real.length - 1} 个进行中的提醒` : '到点会提醒你';
+            } else {
+                tEl.textContent = '暂无任务';
+                dEl.textContent = '让达妮娅帮你记一件事吧';
+            }
+        } catch (e) { /* 忽略解析失败 */ }
     });
 }
 
@@ -636,6 +939,21 @@ function loadSettings() {
                         <input type="checkbox" ${s.value ? 'checked' : ''} data-key="${s.key}" />
                         <span class="slider"></span>
                     </label>`;
+            } else if (s.type === 'model_select' && s.options) {
+                let opts = s.options.map(o =>
+                    `<option value="${o.value}" ${o.value === s.value ? 'selected' : ''}>${o.label}</option>`
+                ).join('');
+                row.innerHTML = `
+                    <span class="set-label">${s.label}</span>
+                    <select class="model-select" data-key="${s.key}">${opts}</select>`;
+            } else if (s.type === 'str' && s.key) {
+                const inputVal = s.value ? s.value.replace(/"/g, '&quot;') : '';
+                row.innerHTML = `
+                    <span class="set-label">${s.label}</span>
+                    <input type="text" class="setting-input" data-key="${s.key}" data-placeholder="${s.placeholder ? s.placeholder.replace(/"/g, '&quot;') : ''}" value="${inputVal}" placeholder="${s.placeholder || ''}" />`;
+            } else if (s.type === 'hint') {
+                row.classList.add('setting-hint-row');
+                row.innerHTML = `<span class="set-hint">${s.label}</span>`;
             } else {
                 row.innerHTML = `
                     <span class="set-label">${s.label}</span>
@@ -643,9 +961,27 @@ function loadSettings() {
             }
             container.appendChild(row);
         });
+        // bool 开关
         container.querySelectorAll('.switch input').forEach(cb => {
             cb.addEventListener('change', () => {
                 bridge.save_setting(cb.dataset.key, cb.checked ? 'true' : 'false');
+            });
+        });
+        // 模型下拉框（切换后重新拉取设置，因为配置项条目会随模型类型变化）
+        container.querySelectorAll('.model-select').forEach(sel => {
+            sel.addEventListener('change', () => {
+                bridge.save_setting(sel.dataset.key, sel.value);
+                // 延迟重渲染，避免 input 焦点状态丢失
+                setTimeout(() => loadSettings(), 600);
+            });
+        });
+        // 文本输入框（带 key 的 str 类型）
+        container.querySelectorAll('.setting-input').forEach(inp => {
+            inp.addEventListener('change', () => {
+                bridge.save_setting(inp.dataset.key, inp.value);
+            });
+            inp.addEventListener('blur', () => {
+                bridge.save_setting(inp.dataset.key, inp.value);
             });
         });
     });

@@ -1,0 +1,8 @@
+# 屏幕感知技能
+name: screen_context
+description: 截屏当前用户界面，视觉模型理解屏幕内容
+version: "1.0"
+tools: ["screen_context"]
+depends: []
+min_harness: small
+disabled: false

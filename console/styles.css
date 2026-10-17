@@ -115,6 +115,8 @@ body {
 
 /* 顶栏 */
 .topbar {
+    position: relative;
+    z-index: 100;  /* 盖住下方页面内容，保证天气提示框可见（backdrop-filter 会隔离 z-index） */
     height: 52px;
     padding: 0 28px;
     display: flex;
@@ -167,6 +169,135 @@ body {
 
 .status-text { color: var(--cyan); }
 .version { margin-left: 12px; }
+
+/* 天气胶囊（拿到数据前隐藏） */
+.weather-chip {
+    position: relative;
+    display: none;
+    align-items: center;
+    gap: 5px;
+    margin-left: 10px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(0, 245, 255, 0.28);
+    background: rgba(0, 245, 255, 0.07);
+    color: rgba(233, 251, 255, 0.85);
+    font-size: 12px;
+    line-height: 1.4;
+    white-space: nowrap;
+    cursor: default;
+    transition: border-color .3s, box-shadow .3s;
+}
+.weather-chip.ready { display: inline-flex; }
+.weather-chip:hover {
+    border-color: var(--cyan-soft);
+    box-shadow: 0 0 10px rgba(0, 245, 255, 0.25);
+}
+.weather-chip .w-icon { font-size: 13px; line-height: 1; }
+.weather-chip .w-temp { font-weight: 600; color: var(--cyan); }
+.weather-chip .w-desc { color: var(--text-dim); }
+
+/* 天气悬停详情：JS 挂到 body 的独立图层（顶栏 backdrop-filter 合成层内 hover 不重绘） */
+.weather-tip-float {
+    display: none;
+    position: fixed;
+    z-index: 99999;
+    padding: 7px 12px;
+    border-radius: 10px;
+    border: 1px solid rgba(0, 245, 255, 0.35);
+    background: rgba(6, 14, 32, 0.96);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5), 0 0 12px rgba(0, 245, 255, 0.15);
+    color: rgba(233, 251, 255, 0.9);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: nowrap;
+    pointer-events: none;
+}
+
+/* ===== 电脑状态页 ===== */
+.status-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 14px;
+    max-width: 980px;
+}
+.status-card {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: rgba(10, 18, 38, 0.5);
+    padding: 16px 18px;
+    min-width: 0;
+}
+.status-card.status-wide { grid-column: 1 / -1; }
+.st-title {
+    font-size: 12px;
+    letter-spacing: 2px;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+}
+.st-main { display: flex; align-items: baseline; gap: 4px; margin-bottom: 10px; }
+.st-big { font-size: 34px; font-weight: 700; color: var(--cyan); text-shadow: 0 0 12px var(--cyan-glow); }
+.st-big-sm { font-size: 22px; font-weight: 600; color: rgba(233, 251, 255, 0.92); min-width: 74px; text-align: right; }
+.st-unit { font-size: 12px; color: var(--text-dim); }
+.st-tag { margin-left: auto; font-size: 12px; color: var(--text-dim); }
+.st-bar {
+    height: 6px;
+    border-radius: 3px;
+    background: rgba(0, 245, 255, 0.08);
+    overflow: hidden;
+}
+.st-bar-fill {
+    height: 100%;
+    width: 0;
+    border-radius: 3px;
+    background: linear-gradient(90deg, var(--cyan), #6be7ff);
+    box-shadow: 0 0 8px var(--cyan-glow);
+    transition: width .6s ease;
+}
+.st-bar-fill.warn { background: linear-gradient(90deg, #ffb84d, #ffd28a); box-shadow: 0 0 8px rgba(255, 184, 77, 0.5); }
+.st-bar-fill.hot { background: linear-gradient(90deg, #ff5c7a, #ff8ca0); box-shadow: 0 0 8px rgba(255, 92, 122, 0.55); }
+.st-sub { margin-top: 10px; font-size: 12px; color: var(--text-dim); }
+.st-cores {
+    display: flex;
+    gap: 4px;
+    align-items: flex-end;
+    height: 44px;
+    margin-top: 12px;
+}
+.core-bar {
+    flex: 1;
+    height: 100%;
+    border-radius: 2px;
+    background: rgba(0, 245, 255, 0.08);
+    display: flex;
+    align-items: flex-end;
+    overflow: hidden;
+}
+.core-fill {
+    width: 100%;
+    background: linear-gradient(180deg, #6be7ff, var(--cyan));
+    transition: height .6s ease;
+}
+.core-fill.warn { background: linear-gradient(180deg, #ffd28a, #ffb84d); }
+.core-fill.hot { background: linear-gradient(180deg, #ff8ca0, #ff5c7a); }
+.net-row { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.net-dir { font-size: 14px; width: 16px; }
+.net-dir.up { color: #7dffc8; }
+.net-dir.down { color: var(--cyan); }
+.sys-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+    color: var(--text-dim);
+    padding: 5px 0;
+    border-bottom: 1px dashed rgba(150, 160, 220, 0.12);
+}
+.sys-row:last-child { border-bottom: none; }
+.sys-val { color: rgba(233, 251, 255, 0.9); }
+.disk-row { display: flex; align-items: center; gap: 12px; padding: 7px 0; }
+.disk-mount { font-size: 13px; color: rgba(233, 251, 255, 0.9); width: 42px; flex-shrink: 0; }
+.disk-bar { flex: 1; }
+.disk-detail { font-size: 12px; color: var(--text-dim); flex-shrink: 0; }
 
 /* ===== 无边框窗口控制 ===== */
 .win-controls {
@@ -271,7 +402,91 @@ body {
     border: 2px solid var(--cyan);
     box-shadow: 0 0 30px var(--cyan-glow), 0 0 60px var(--magenta-glow);
     background: rgba(255, 255, 255, 0.05);
+    transition: border-color .4s, box-shadow .4s, filter .4s;
 }
+
+/* ===== Live2D 立绘 ===== */
+.l2d-canvas {
+    display: none;
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    pointer-events: auto;
+    z-index: 2;
+}
+.avatar-wrap.l2d-active {
+    width: 200px;
+    height: 200px;
+    margin-bottom: 8px;
+}
+.avatar-wrap.l2d-active .l2d-canvas { display: block; }
+.avatar-wrap.l2d-active .avatar-glow { opacity: 0.25; }
+
+/* ===== 情绪动画（LLM 情绪标签驱动） ===== */
+@keyframes emo-bounce {
+    0%, 100% { transform: translateY(0); }
+    30% { transform: translateY(-10px); }
+    50% { transform: translateY(0); }
+    70% { transform: translateY(-5px); }
+}
+@keyframes emo-shake {
+    0%, 100% { transform: translateX(0) rotate(0); }
+    20% { transform: translateX(-4px) rotate(-2deg); }
+    40% { transform: translateX(4px) rotate(2deg); }
+    60% { transform: translateX(-3px) rotate(-1.5deg); }
+    80% { transform: translateX(3px) rotate(1.5deg); }
+}
+@keyframes emo-droop {
+    0%, 100% { transform: translateY(0) scale(1); }
+    50% { transform: translateY(6px) scale(0.96); }
+}
+@keyframes emo-pop {
+    0% { transform: scale(1); }
+    40% { transform: scale(1.12); }
+    100% { transform: scale(1); }
+}
+@keyframes emo-float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(5px); }
+}
+@keyframes emo-sway {
+    0%, 100% { transform: rotate(0); }
+    25% { transform: rotate(-3deg); }
+    75% { transform: rotate(3deg); }
+}
+@keyframes emo-talk {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-4px); }
+}
+
+.avatar-wrap[class*="emotion-"] .avatar { will-change: transform; }
+.emotion-happy .avatar {
+    animation: emo-bounce 0.9s ease-in-out 2;
+    border-color: #ff9ecf;
+    box-shadow: 0 0 30px rgba(255, 158, 207, 0.8), 0 0 60px rgba(255, 105, 180, 0.5);
+}
+.emotion-happy .avatar-glow { background: conic-gradient(from 0deg, #ff9ecf, #ffd1e8, #ff9ecf); }
+.emotion-angry .avatar {
+    animation: emo-shake 0.5s ease-in-out 2;
+    border-color: #ff6b6b;
+    box-shadow: 0 0 30px rgba(255, 80, 80, 0.8), 0 0 60px rgba(255, 60, 60, 0.45);
+}
+.emotion-angry .avatar-glow { background: conic-gradient(from 0deg, #ff6b6b, #ffa07a, #ff6b6b); }
+.emotion-sad .avatar {
+    animation: emo-droop 2.4s ease-in-out infinite;
+    filter: saturate(0.55) brightness(0.8);
+}
+.emotion-surprised .avatar {
+    animation: emo-pop 0.5s ease-out 2;
+    border-color: #ffe066;
+    box-shadow: 0 0 30px rgba(255, 224, 102, 0.8), 0 0 60px rgba(255, 200, 60, 0.45);
+}
+.emotion-sleepy .avatar {
+    animation: emo-float 3.2s ease-in-out infinite;
+    filter: brightness(0.75) saturate(0.7);
+}
+.emotion-thinking .avatar { animation: emo-sway 2.6s ease-in-out infinite; }
+.emotion-speaking .avatar { animation: emo-talk 0.7s ease-in-out infinite; }
 
 .greeting {
     font-size: 36px;
@@ -376,6 +591,10 @@ body {
     transform: translateY(-2px);
 }
 
+.info-card-link {
+    cursor: pointer;
+}
+
 .card-label {
     font-size: 11px;
     color: var(--text-dim);
@@ -459,34 +678,6 @@ body {
     min-width: 0;
 }
 
-.msg-name {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding-left: 4px;
-    font-size: 12px;
-    letter-spacing: 2px;
-    color: rgba(233, 251, 255, 0.6);
-}
-
-.name-diamond {
-    color: var(--cyan);
-    font-size: 10px;
-    text-shadow: 0 0 6px var(--cyan-glow);
-}
-
-.msg-avatar {
-    width: 38px;
-    height: 38px;
-    border-radius: 50%;
-    overflow: hidden;
-    flex-shrink: 0;
-    border: 1px solid var(--cyan);
-    box-shadow: 0 0 12px rgba(0, 245, 255, 0.25);
-}
-
-.msg-avatar img { width: 100%; height: 100%; object-fit: cover; }
-
 .msg-bubble {
     padding: 13px 18px;
     border-radius: 16px;
@@ -567,50 +758,6 @@ body {
     margin-bottom: 4px;
 }
 .section-sub {
-    font-size: 12px;
-    color: var(--text-dim);
-}
-
-/* ===== 记忆页 ===== */
-.memory-list {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    max-width: 720px;
-}
-
-.memory-item {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: 14px 18px;
-    transition: all 0.25s ease;
-}
-
-.memory-item:hover {
-    border-color: var(--cyan);
-    box-shadow: var(--shadow-cyan);
-}
-
-.mem-tag {
-    font-size: 11px;
-    padding: 3px 10px;
-    border-radius: 20px;
-    background: var(--magenta-soft);
-    color: var(--magenta);
-    border: 1px solid var(--magenta-soft);
-    flex-shrink: 0;
-}
-
-.mem-text {
-    flex: 1;
-    font-size: 14px;
-}
-
-.mem-time {
     font-size: 12px;
     color: var(--text-dim);
 }
@@ -767,6 +914,45 @@ body {
 .switch input:checked + .slider::before {
     transform: translateX(18px);
     background: var(--cyan);
+}
+
+/* 模型下拉框 */
+.model-select {
+    font-size: 13px;
+    color: var(--cyan);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    cursor: pointer;
+    outline: none;
+}
+.model-select:hover { border-color: var(--cyan); }
+
+/* 设置页文本输入框 */
+.setting-input {
+    font-size: 13px;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    width: 220px;
+    outline: none;
+}
+.setting-input:hover, .setting-input:focus { border-color: var(--cyan); }
+.setting-input:focus { color: var(--cyan); }
+
+/* 设置页提示行（随模型切换的动态说明） */
+.setting-hint-row {
+    display: block;
+    background: rgba(0, 245, 255, 0.05);
+}
+.set-hint {
+    display: block;
+    font-size: 11px;
+    color: var(--text-dim);
+    padding: 6px 12px;
 }
 
 /* ===== 滚动条 ===== */

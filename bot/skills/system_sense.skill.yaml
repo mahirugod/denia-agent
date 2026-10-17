@@ -1,0 +1,8 @@
+# 系统感知技能
+name: system_sense
+description: 全局感知（Ollama 存活/磁盘空间/时间事件/待办提醒）
+version: "1.0"
+tools: ["system_sense"]
+depends: []
+min_harness: small
+disabled: false

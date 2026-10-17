@@ -1,0 +1,8 @@
+# 天气技能
+name: weather
+description: 查询实时天气/气温/降雨时段
+version: "1.0"
+tools: ["query_weather"]
+depends: []
+min_harness: tiny
+disabled: false

@@ -6,15 +6,23 @@ __pycache__/
 GPT-SoVITS/*
 !GPT-SoVITS/api_v2.py
 napcat/
+open-interpreter/
+models/
+
+# 用户专属敏感数据（含 API Key / 个人画像 / 聊天记录，不入库）
+settings.json
+bot/data/
+dania.char
 
 # 运行时产物 / 缓存 / 用户数据
 bot/media_cache/
-bot/data/
 bot/knowledge/
 bot/temp_audio.*
 *.silk
 *.log
 *.wav
+tts_log.txt
+_move_quark_result.txt
 
 # 编辑器与系统
 .vscode/

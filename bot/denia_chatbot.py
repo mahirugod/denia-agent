@@ -353,7 +353,8 @@ class DeniaChatbot:
             on_delta(delta): 每个清洗后的增量文本回调一次（供打字机实时显示）
         """
         if self.use_llm and self.llm is not None:
-            return self.llm.get_response_stream(text, on_sentence=on_sentence, on_delta=on_delta)
+            return self.llm.get_response_stream(
+                text, on_sentence=on_sentence, on_delta=on_delta)
         # 非LLM模式：退化为一次性回复
         reply = self.get_response(text, play_voice=False)
         if on_sentence and reply:

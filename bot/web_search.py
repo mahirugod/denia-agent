@@ -12,10 +12,12 @@
 import re
 import os
 import time
+import html
 import threading
 import queue
 from typing import Optional, List
 
+import requests
 from playwright.sync_api import sync_playwright, Browser, Page, TimeoutError as PWTimeout
 
 # 系统 Edge 路径
@@ -35,6 +37,75 @@ def _clean_text(text: str) -> str:
     # 移除其他不可见字符
     text = re.sub(r'[\u200b-\u200f\u2028-\u202f\u205f-\u206f]', '', text)
     return text.strip()
+
+
+_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def _strip_tags(html: str) -> str:
+    """去除 HTML 标签"""
+    return _TAG_RE.sub('', html)
+
+
+def search_bing_lite(query: str, timeout: int = 6) -> Optional[str]:
+    """轻量搜索：requests 直抓 cn.bing.com，解析摘要（无浏览器，快）
+
+    返回格式化的摘要文本（标题 + 描述）；失败返回 None，由调用方决定是否降级。
+    """
+    _t = time.time()
+    url = "https://cn.bing.com/search"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    try:
+        resp = requests.get(url, params={"q": query, "count": "10"}, headers=headers, timeout=timeout)
+    except Exception as e:
+        print(f"[轻量搜索] 请求失败: {e}")
+        return None
+
+    if resp.status_code != 200:
+        print(f"[轻量搜索] HTTP {resp.status_code}")
+        return None
+
+    html_text = resp.content.decode("utf-8", errors="ignore")
+
+    seen = []
+    for block in re.findall(r'<li class="b_algo[^"]*".*?</li>', html_text, re.S):
+        title = ""
+        snippet = ""
+        m = re.search(r'<h2[^>]*>(.*?)</h2>', block, re.S)
+        if m:
+            title = _clean_text(html.unescape(_strip_tags(m.group(1))))
+        m = re.search(r'<p[^>]*>(.*?)</p>', block, re.S)
+        if m:
+            snippet = _clean_text(html.unescape(_strip_tags(m.group(1))))
+        # 去掉 Bing 摘要末尾固定的"…阅读更多"
+        snippet = re.sub(r'…?阅读更多$', '', snippet).strip()
+        if not title and not snippet:
+            continue
+        seen.append((title, snippet))
+        if len(seen) >= 5:
+            break
+
+    if not seen:
+        print("[轻量搜索] 未解析到结果（Bing 可能返回验证页/JS 页）")
+        return None
+
+    lines = []
+    for title, snippet in seen:
+        if title and snippet:
+            lines.append(f"{title}：{snippet}"[:200])
+        elif title:
+            lines.append(title[:200])
+        else:
+            lines.append(snippet[:200])
+
+    print(f"[轻量搜索] 返回 {len(lines)} 条摘要，耗时 {time.time()-_t:.2f}s")
+    return "\n".join(lines)
 
 # ────────────────────────────────────────
 # 专用浏览器线程（解决 Playwright 跨线程问题）

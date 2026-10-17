@@ -1,0 +1,8 @@
+# 提醒技能
+name: reminder
+description: 设置定时提醒
+version: "1.0"
+tools: ["set_reminder"]
+depends: []
+min_harness: tiny
+disabled: false

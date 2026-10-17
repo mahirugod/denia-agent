@@ -37,6 +37,11 @@ class BridgeObject(QObject):
     log = Signal(str)                  # 日志转发
     win_state_changed = Signal(bool)   # 最大化状态变化
     reminder_fired = Signal(str)       # 定时提醒到点（提醒内容）
+    emotion_changed = Signal(str)      # 情绪状态变化（idle/happy/sleepy/angry...）
+    voice_playback = Signal(bool)      # 语音正在播放（Live2D 口型同步）
+    weather_updated = Signal(str)      # 天气更新（JSON 字符串）
+    system_updated = Signal(str)       # 电脑状态更新（JSON 字符串）
+    user_message = Signal(str)         # 语音识别用户文本（回显为用户气泡）
 
     def __init__(self, app):
         super().__init__()
@@ -82,6 +87,24 @@ class BridgeObject(QObject):
             return json.dumps(memories, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": str(e)})
+
+    # ===== 天气 =====
+    @Slot(result=str)
+    def get_weather(self) -> str:
+        """JS 调用：获取最近天气缓存（JSON）"""
+        try:
+            return self.app.get_weather()
+        except Exception:
+            return "{}"
+
+    # ===== 电脑状态 =====
+    @Slot(result=str)
+    def get_system_status(self) -> str:
+        """JS 调用：获取最近一次电脑状态（JSON）"""
+        try:
+            return self.app.get_system_status()
+        except Exception:
+            return "{}"
 
     # ===== 任务/提醒 =====
     @Slot(result=str)
@@ -196,7 +219,7 @@ class ConsoleWindow(QWidget):
     def __init__(self, app):
         super().__init__()
         self.app = app
-        self.setWindowTitle("达妮娅 · 陪伴系统")
+        self.setWindowTitle("达妮娅 · 终端")
         self.resize(1080, 720)
         self.setMinimumSize(860, 600)
 
@@ -218,6 +241,12 @@ class ConsoleWindow(QWidget):
         # 页面底色设为深色，消除默认白底在窗口边缘/加载时露出的白边
         self.view.page().setBackgroundColor(QColor("#020814"))
         self.view.setStyleSheet("border: none; background: #020814;")
+        # 允许 file:// 页面 fetch 本地资源（Live2D 模型 JSON/贴图加载需要）
+        settings = self.view.page().settings()
+        settings.setAttribute(
+            settings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        settings.setAttribute(
+            settings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
 
         # 加载本地 HTML
         html_path = os.path.join(os.path.dirname(__file__), "console", "index.html")

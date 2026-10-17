@@ -28,7 +28,7 @@ from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal, QTime
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
-# 服务配置
+# 各服务配置
 class ServiceConfig:
     def __init__(self, name: str, display_name: str, command: str,
                  args: List[str], cwd: str, port: int = 0,
@@ -43,17 +43,76 @@ class ServiceConfig:
         self.critical = critical      # 是否关键服务（失败会报警）
 
 
+def _find_ollama_exe():
+    """自动探测 ollama 可执行文件位置（跨机器可用）。
+    优先级：
+      1. 环境变量 OLLAMA_HOME（指向 Ollama 安装目录，目录内找 ollama.exe）
+      2. 常见安装位置（C:\\Program Files\\Ollama、C:\\Program Files (x86)\\Ollama、
+         D:\\Ollama、%LOCALAPPDATA%\\Ollama）
+      3. PATH 中的 ollama
+    找不到返回 None，调用方需给出友好提示。
+    """
+    import shutil
+
+    exe_name = "ollama.exe" if os.name == "nt" else "ollama"
+
+    # 1) OLLAMA_HOME（目录或 exe 路径都接受）
+    home = os.environ.get("OLLAMA_HOME", "").strip()
+    if home:
+        if os.path.isdir(home):
+            cand = os.path.join(home, exe_name)
+            if os.path.isfile(cand):
+                return cand
+        elif os.path.isfile(home):
+            return home
+
+    # 2) 常见安装位置
+    candidates = [
+        os.path.join("C:", "Program Files", "Ollama"),
+        os.path.join("C:", "Program Files (x86)", "Ollama"),
+        os.path.join("D:", "Ollama"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Ollama"),
+    ]
+    for c in candidates:
+        if c:
+            cand_exe = os.path.join(c, exe_name)
+            if os.path.isfile(cand_exe):
+                return cand_exe
+
+    # 3) PATH
+    found = shutil.which("ollama")
+    if found:
+        return found
+    return None
+
+
+def _start_ollama():
+    """启动 Ollama。找不到可执行文件时给出明确指引。"""
+    exe = _find_ollama_exe()
+    if not exe:
+        import warnings
+        warnings.warn(
+            "未找到 Ollama 可执行文件。请安装 Ollama（https://ollama.com/download），"
+            "并把 OLLAMA_HOME 环境变量指向其安装目录（例如 C:\\Program Files\\Ollama）。"
+        )
+        return None
+    return exe, [
+        "serve",
+    ]
+
+
 # 各服务配置
+_OLLAMA_EXE = _find_ollama_exe()
 SERVICE_CONFIGS = {
     "ollama": ServiceConfig(
         name="ollama",
         display_name="Ollama",
-        command=r"D:\Ollama\ollama.exe",
+        command=_OLLAMA_EXE or "ollama",  # 找不到时占位，启动前会在日志里给指引
         args=["serve"],
-        cwd=r"D:\Ollama",
+        cwd=os.path.dirname(_OLLAMA_EXE) if _OLLAMA_EXE else os.getcwd(),
         port=11434,
         startup_wait=5,
-        critical=True,
+        critical=False,  # Ollama 为可选本地推理后端（仅本地 Ollama 模型需要，云端/ags 模型无需）
     ),
     "napcat": ServiceConfig(
         name="napcat",
@@ -69,10 +128,10 @@ SERVICE_CONFIGS = {
         name="gpt_sovits",
         display_name="GPT-SoVITS 语音",
         command=os.path.join(_ROOT, "GPT-SoVITS", "runtime", "python.exe"),
-        args=["-I", "api_v2.py"],
+        args=["api_v2.py"],
         cwd=os.path.join(_ROOT, "GPT-SoVITS"),
         port=9880,
-        startup_wait=25,  # CPU 模式加载模型约 23 秒，留余量
+        startup_wait=50,  # GPU 模式首次加载需初始化 CUDA，比 CPU 慢，留足余量
         critical=False,
     ),
     "bot": ServiceConfig(
@@ -307,6 +366,18 @@ class ProcessManager(QObject):
         env.insert("PYTHONIOENCODING", "utf-8")
         env.insert("PYTHONUTF8", "1")
         env.insert("LANG", "en_US.UTF-8")
+        # Ollama 模型存储重定向到项目内可写路径（避免默认 D:\ollama_models 权限问题）
+        # 注意：系统可能残留旧的全局 OLLAMA_MODELS 环境变量（指向 D:\ollama_models），
+        # 必须先 remove 再 insert，否则 systemEnvironment 里的旧值会覆盖我们的设置
+        if name == "ollama":
+            models_dir = os.path.join(_ROOT, "models")
+            env.remove("OLLAMA_MODELS")
+            env.insert("OLLAMA_MODELS", models_dir)
+            env.insert("OLLAMA_KEEP_ALIVE", "-1")
+            # 透传 OLLAMA_HOME，让 ollama 默认把模型拉进项目 models/
+            if _OLLAMA_EXE:
+                env.remove("OLLAMA_HOME")
+                env.insert("OLLAMA_HOME", os.path.dirname(_OLLAMA_EXE))
         process.setProcessEnvironment(env)
 
         # 连接信号
@@ -333,11 +404,12 @@ class ProcessManager(QObject):
 
         return True
 
-    def start_all(self, skip: List[str] = None):
+    def start_all(self, skip: List[str] = None, skip_ollama: bool = False):
         """并行启动所有服务（优化：不再串行等待）
 
         Args:
             skip: 要跳过的服务名列表（如 ["napcat", "bot"]）
+            skip_ollama: True 时跳过 Ollama 启动（云端/ags 模型不需要本地推理后端）
         """
         skip = set(skip or [])
         self.log_received.emit("=" * 50)
@@ -353,9 +425,10 @@ class ProcessManager(QObject):
         # 关键服务串行启动（避免端口检测冲突）
         self.log_received.emit("⚠️  有服务未启动，正在自动补齐...")
 
-        # 1. 先启动 Ollama（必须有）
-        self.start_service("ollama")
-        time.sleep(2)  # 确保端口稳定
+        # 1. Ollama 为可选本地推理后端（云端/ags 模型或用户显式 skip_ollama 时跳过）
+        if not skip_ollama and "ollama" not in skip:
+            self.start_service("ollama")
+            time.sleep(2)  # 确保端口稳定
 
         # 2. NapCat + QQ 机器人（可选，取决于用户开关；bot 依赖 NapCat，随之启动）
         if "napcat" not in skip:
@@ -369,10 +442,10 @@ class ProcessManager(QObject):
         if "gpt_sovits" not in skip:
             threading.Thread(target=self.start_service, args=("gpt_sovits",), daemon=True).start()
 
-        # 等待关键服务就绪
+        # 等待关键服务就绪（Ollama 被跳过时不阻塞等待）
         start = time.time()
         while time.time() - start < 15:
-            ok_ollama = self._states.get("ollama") == self.STATE_RUNNING
+            ok_ollama = (skip_ollama or "ollama" in skip) or self._states.get("ollama") == self.STATE_RUNNING
             ok_napcat = "napcat" in skip or self._states.get("napcat") == self.STATE_RUNNING
             ok_bot = "bot" in skip or self._states.get("bot") == self.STATE_RUNNING
             if ok_ollama and ok_napcat and ok_bot:
@@ -482,6 +555,12 @@ class ProcessManager(QObject):
                 env.insert("PYTHONIOENCODING", "utf-8")
                 env.insert("PYTHONUTF8", "1")
                 env.insert("LANG", "en_US.UTF-8")
+                # Ollama 模型存储重定向到项目内可写路径（先清掉系统残留的全局 OLLAMA_MODELS）
+                if name == "ollama":
+                    models_dir = os.path.join(_ROOT, "models")
+                    env.remove("OLLAMA_MODELS")
+                    env.insert("OLLAMA_MODELS", models_dir)
+                    env.insert("OLLAMA_KEEP_ALIVE", "-1")
                 process.setProcessEnvironment(env)
                 process.readyReadStandardOutput.connect(
                     lambda p=process, n=name: self._read_stdout(p, n))

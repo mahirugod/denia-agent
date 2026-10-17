@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>达妮娅 · 陪伴系统</title>
+    <title>达妮娅 · 终端</title>
     <link rel="stylesheet" href="styles.css" />
     <link rel="icon" type="image/png" href="assets/dania_idle.png" />
     <script src="qwebchannel.js"></script>
@@ -19,11 +19,11 @@
                 <button class="nav-btn" data-page="collab" title="协作">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
                 </button>
-                <button class="nav-btn" data-page="memory" title="记忆">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></svg>
-                </button>
                 <button class="nav-btn" data-page="task" title="任务">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+                </button>
+                <button class="nav-btn" data-page="status" title="电脑状态">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
                 </button>
             </div>
             <div class="nav-bottom">
@@ -42,12 +42,17 @@
             <header class="topbar">
                 <div class="brand">
                     <span class="brand-cn">达妮娅</span>
-                    <span class="brand-sub">陪伴系统</span>
+                    <span class="brand-sub">终端</span>
                 </div>
                 <div class="topbar-right">
                     <span class="status-dot online"></span>
                     <span class="status-text">在线</span>
-                    <span class="version">v0.9.7</span>
+                    <span class="weather-chip" id="weather-chip">
+                        <span class="w-icon"></span>
+                        <span class="w-temp"></span>
+                        <span class="w-desc"></span>
+                    </span>
+                    <span class="version">v5.2.1</span>
                     <div class="win-controls">
                         <button class="win-btn" id="win-min" title="最小化">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -66,9 +71,10 @@
             <!-- 首页内容（含对话区） -->
             <section class="page page-home active" id="page-home">
                 <div class="hero">
-                    <div class="avatar-wrap">
+                    <div class="avatar-wrap" id="avatar-wrap">
                         <div class="avatar-glow"></div>
                         <img src="assets/dania_idle.png" alt="达妮娅" class="avatar" id="hero-avatar" />
+                        <canvas id="l2d-canvas" class="l2d-canvas" width="200" height="200"></canvas>
                     </div>
                     <h1 class="greeting" id="greeting">中午好</h1>
                     <p class="greeting-sub">今天想一起做点什么？</p>
@@ -86,9 +92,7 @@
                 <!-- 对话消息区（首页内嵌） -->
                 <div class="home-chat-messages" id="chat-messages">
                     <div class="msg msg-bot">
-                        <div class="msg-avatar"><img src="assets/dania_idle.png" /></div>
                         <div class="msg-body">
-                            <div class="msg-name"><span class="name-diamond">◇</span>达妮娅</div>
                             <div class="msg-bubble">你好呀～有什么想和我说的吗？</div>
                             <div class="msg-actions">
                                 <button class="msg-act act-voice" title="播放语音">
@@ -104,15 +108,15 @@
 
                 <!-- 底部双栏卡片 -->
                 <div class="info-grid">
-                    <div class="info-card">
+                    <div class="info-card info-card-link" id="home-task-card" data-page="task" title="查看任务">
                         <div class="card-label">当前任务</div>
-                        <div class="card-title" id="task-title">整理陪伴系统灰度骨架</div>
+                        <div class="card-title" id="task-title">整理终端灰度骨架</div>
                         <div class="card-desc" id="task-desc">下一步：确认首页与对话结构</div>
                     </div>
-                    <div class="info-card">
-                        <div class="card-label">最近记忆</div>
-                        <div class="card-title" id="memory-title">晚间记录</div>
-                        <div class="card-desc" id="memory-desc">你说过喜欢星空，记进了她的记忆里</div>
+                    <div class="info-card info-card-link" id="home-collab-card" data-page="collab" title="查看协作">
+                        <div class="card-label">协作</div>
+                        <div class="card-title" id="collab-card-title">暂无协作</div>
+                        <div class="card-desc" id="collab-card-desc">空闲</div>
                     </div>
                 </div>
             </section>
@@ -158,24 +162,51 @@
                 </div>
             </section>
 
-            <!-- 记忆页 -->
-            <section class="page page-memory" id="page-memory">
-                <div class="section-head"><h2>记忆库</h2><span class="section-sub">达妮娅记住的事</span></div>
-                <div class="memory-list">
-                    <div class="memory-item"><span class="mem-tag">偏好</span><span class="mem-text">你喜欢星空，尤其夏天的银河</span><span class="mem-time">今天</span></div>
-                    <div class="memory-item"><span class="mem-tag">日常</span><span class="mem-text">你习惯在深夜工作，作息偏晚</span><span class="mem-time">昨天</span></div>
-                    <div class="memory-item"><span class="mem-tag">对话</span><span class="mem-text">你说达妮娅的声音很温柔</span><span class="mem-time">3天前</span></div>
-                </div>
-            </section>
-
             <!-- 任务页 -->
             <section class="page page-task" id="page-task">
                 <div class="section-head"><h2>任务清单</h2><span class="section-sub">当前进行中的任务</span></div>
                 <div class="task-list">
-                    <div class="task-item"><span class="task-check done">✓</span><span class="task-text">整理陪伴系统灰度骨架</span><span class="task-prio prio-high">高</span></div>
+                    <div class="task-item"><span class="task-check done">✓</span><span class="task-text">整理终端灰度骨架</span><span class="task-prio prio-high">高</span></div>
                     <div class="task-item"><span class="task-check">○</span><span class="task-text">确认首页与对话结构</span><span class="task-prio prio-high">高</span></div>
                     <div class="task-item"><span class="task-check">○</span><span class="task-text">接入语音合成流式播放</span><span class="task-prio prio-mid">中</span></div>
                     <div class="task-item"><span class="task-check">○</span><span class="task-text">优化 STT 首次加载速度</span><span class="task-prio prio-low">低</span></div>
+                </div>
+            </section>
+
+            <!-- 电脑状态页 -->
+            <section class="page page-status" id="page-status">
+                <div class="section-head"><h2>电脑状态</h2><span class="section-sub">实时监控 · 每 3 秒刷新</span></div>
+                <div class="status-grid">
+                    <div class="status-card">
+                        <div class="st-title">CPU</div>
+                        <div class="st-main"><span class="st-big" id="cpu-percent">--</span><span class="st-unit">%</span>
+                            <span class="st-tag" id="cpu-freq"></span></div>
+                        <div class="st-bar"><div class="st-bar-fill" id="cpu-bar"></div></div>
+                        <div class="st-cores" id="cpu-cores"></div>
+                    </div>
+                    <div class="status-card">
+                        <div class="st-title">内存</div>
+                        <div class="st-main"><span class="st-big" id="mem-percent">--</span><span class="st-unit">%</span>
+                            <span class="st-tag" id="mem-detail"></span></div>
+                        <div class="st-bar"><div class="st-bar-fill" id="mem-bar"></div></div>
+                        <div class="st-sub" id="swap-detail"></div>
+                    </div>
+                    <div class="status-card">
+                        <div class="st-title">网络</div>
+                        <div class="net-row"><span class="net-dir up">↑</span><span class="st-big-sm" id="net-up">--</span><span class="st-unit">KB/s</span></div>
+                        <div class="net-row"><span class="net-dir down">↓</span><span class="st-big-sm" id="net-down">--</span><span class="st-unit">KB/s</span></div>
+                        <div class="st-sub" id="net-total"></div>
+                    </div>
+                    <div class="status-card">
+                        <div class="st-title">系统</div>
+                        <div class="sys-row"><span>开机时长</span><span class="sys-val" id="sys-uptime">--</span></div>
+                        <div class="sys-row"><span>进程数</span><span class="sys-val" id="sys-procs">--</span></div>
+                        <div class="sys-row" id="sys-battery-row" style="display:none"><span>电池</span><span class="sys-val" id="sys-battery">--</span></div>
+                    </div>
+                    <div class="status-card status-wide">
+                        <div class="st-title">磁盘</div>
+                        <div id="disk-list"></div>
+                    </div>
                 </div>
             </section>
 
@@ -197,7 +228,7 @@
                     <div class="setting-row"><span class="set-label">角色形象</span><span class="set-value">达妮娅</span></div>
                     <div class="setting-row"><span class="set-label">默认缩放</span><span class="set-value">0.7x</span></div>
                     <div class="setting-row"><span class="set-label">语音合成</span><span class="set-value">GPT-SoVITS</span></div>
-                    <div class="setting-row"><span class="set-label">LLM 模型</span><span class="set-value">qwen2.5:7b</span></div>
+                    <div class="setting-row"><span class="set-label">LLM 模型</span><span class="set-value">（加载中...）</span></div>
                     <div class="setting-row"><span class="set-label">回复长度</span><span class="set-value">简短（1-2句）</span></div>
                     <div class="setting-row"><span class="set-label">开机自启</span><label class="switch"><input type="checkbox" /><span class="slider"></span></label></div>
                 </div>

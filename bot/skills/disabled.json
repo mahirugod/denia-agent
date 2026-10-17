@@ -1,0 +1,8 @@
+{
+  "weather": false,
+  "reminder": false,
+  "time": false,
+  "system_sense": false,
+  "screen_context": false,
+  "app_launcher": false
+}

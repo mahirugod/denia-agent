@@ -50,6 +50,7 @@ class GPTSoVITSAdapter(TTSAdapter):
                 "batch_size": 1,
                 "media_type": "wav",
                 "streaming_mode": False,
+                "seed": 42,
             }
             response = requests.post(f"{self.api_url}/tts", json=payload, timeout=60)
             if response.status_code == 200 and len(response.content) > 100:
@@ -156,6 +157,7 @@ def _num_to_cn(n: int) -> str:
 def normalize_for_tts(text: str) -> str:
     """
     数字读法规范化，让 GPT-SoVITS 读得更自然：
+    - 温度 15℃ / -5℃ / 15°C → 十五摄氏度 / 零下五摄氏度 / 十五摄氏度
     - 时间 20:30 → 二十点三十分
     - 百分比 85% → 百分之八十五
     - 小数 3.5 → 三点五
@@ -163,6 +165,24 @@ def normalize_for_tts(text: str) -> str:
     """
     if not text:
         return text
+
+    # 温度（必须在数字读法之前处理，避免数字先被转成中文）
+    # 先处理范围温度 "15~23℃" / "-1到2℃" / "15到23度" → "十五到二十三摄氏度"
+    def _temp_range_repl(m):
+        lo_str, hi = m.group(1), int(m.group(2))
+        lo = int(lo_str)
+        lo_cn = f"零下{_num_to_cn(abs(lo))}" if lo < 0 else _num_to_cn(lo)
+        hi_cn = f"零下{_num_to_cn(abs(hi))}" if hi < 0 else _num_to_cn(hi)
+        return f"{lo_cn}到{hi_cn}摄氏度"
+    text = re.sub(r'(-?\d+)\s*(?:[~～]|到)\s*(-?\d+)\s*(?:℃|°C|度)', _temp_range_repl, text)
+    # 再处理单温度 -5℃ / 23°C / 15度
+    def _temp_repl(m):
+        sign, num = m.group(1) or "", m.group(2)
+        cn_num = _num_to_cn(int(num))
+        if sign:
+            return f"零下{cn_num}摄氏度"
+        return f"{cn_num}摄氏度"
+    text = re.sub(r'(-?)(\d+)(?:℃|°C|度)', _temp_repl, text)
 
     # 时间 HH:MM / HH点MM
     def _time_repl(m):

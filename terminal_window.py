@@ -6,12 +6,13 @@
 """
 import os
 import re
+import sys
 import math
 from datetime import datetime
 
 from PySide6.QtCore import (
     Qt, QTimer, QObject, Signal, QRect, QPoint, QSize, QPropertyAnimation,
-    QEasingCurve, QThread,
+    QEasingCurve, QThread, QEvent,
 )
 from PySide6.QtGui import (
     QPainter, QPixmap, QColor, QFont, QFontMetrics, QBrush, QPen, QLinearGradient,
@@ -402,13 +403,14 @@ class TerminalWindow(QMainWindow):
 
     # 对外信号
     chat_message_sent = Signal(str)          # 用户发送文本
-    voice_input_requested = Signal()          # 请求语音输入
-    history_requested = Signal()              # 请求历史
-    backtrack_requested = Signal(int)         # 回溯历史
+    voice_input_started = Signal()           # 空格按下：开始录音
+    voice_input_stopped = Signal()          # 空格松开：停止录音并识别
+    voice_input_cancelled = Signal()        # 识别中按空格：打断并取消识别
+    voice_input_result = Signal(str)        # 识别结果写入输入框
     service_start_requested = Signal()
     service_stop_requested = Signal()
     service_start_single = Signal(str)       # 单个服务启动 (内部键名)
-    service_stop_single = Signal(str)        # 单个服务停止 (内部键名)
+    service_stop_single = Signal(str)         # 单个服务停止 (内部键名)
     minimize_to_pet = Signal()                # 最小化为悬浮小人
     open_console_requested = Signal()         # 打开 Web 控制台
     settings_save_requested = Signal()        # 请求保存设置
@@ -426,6 +428,14 @@ class TerminalWindow(QMainWindow):
         self._setup_ui()
         self._setup_tray()
         self._apply_background()
+
+        # 按住说话状态（空格 / 麦克风按钮共用）
+        self._mic_recording = False
+        self._mic_recognizing = False  # 识别中（可点击打断）
+        self._mic_space_trigger = False  # 空格是否当前作为"开始录音"触发源
+
+        # 全局监听空格键：按住说话（排除输入框聚焦时，避免打字误触）
+        QApplication.instance().installEventFilter(self)
 
         # 打字机状态
         self._current_bot_bubble = None
@@ -473,10 +483,9 @@ class TerminalWindow(QMainWindow):
         # 主内容区（堆叠面板）
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_home_panel())    # 0 首页（含对话）
-        self.stack.addWidget(self._build_memory_panel())  # 1 记忆
-        self.stack.addWidget(self._build_task_panel())    # 2 任务
-        self.stack.addWidget(self._build_agent_panel())   # 3 智能体
-        self.stack.addWidget(self._build_settings_panel())# 4 设置
+        self.stack.addWidget(self._build_task_panel())    # 1 任务
+        self.stack.addWidget(self._build_agent_panel())   # 2 智能体
+        self.stack.addWidget(self._build_settings_panel())# 3 设置
         root.addWidget(self.stack, 1)
 
         # 侧边栏在 stack 之后激活（避免 stack 未定义）
@@ -507,7 +516,6 @@ class TerminalWindow(QMainWindow):
         self.nav_buttons = []
         navs = [
             ("🏠", "首页", "H"),
-            ("🧠", "记忆", "M"),
             ("📋", "任务", "T"),
             ("🤖", "智能体", "A"),
             ("⚙️", "设置", "S"),
@@ -580,7 +588,7 @@ class TerminalWindow(QMainWindow):
         input_row = QHBoxLayout()
         input_row.setSpacing(10)
         self.input_box = QLineEdit()
-        self.input_box.setPlaceholderText("和达妮娅说点什么…  (Enter 发送)")
+        self.input_box.setPlaceholderText("和达妮娅说点什么…  (按住空格说话，Enter 发送)")
         self.input_box.setFixedHeight(44)
         self.input_box.setStyleSheet("""
             QLineEdit {
@@ -599,22 +607,6 @@ class TerminalWindow(QMainWindow):
         self.input_box.returnPressed.connect(self._on_send)
         input_row.addWidget(self.input_box, 1)
 
-        self.mic_btn = QPushButton("🎤")
-        self.mic_btn.setFixedSize(44, 44)
-        self.mic_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.mic_btn.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(0, 245, 255, 0.12);
-                border: 1px solid rgba(0, 245, 255, 0.5);
-                border-radius: 22px;
-                font-size: 18px;
-            }
-            QPushButton:hover { background-color: rgba(0, 245, 255, 0.25); }
-            QPushButton:pressed { background-color: rgba(0, 245, 255, 0.35); }
-        """)
-        self.mic_btn.clicked.connect(self.voice_input_requested.emit)
-        input_row.addWidget(self.mic_btn)
-
         self.send_btn = QPushButton("➤")
         self.send_btn.setFixedSize(44, 44)
         self.send_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -631,15 +623,18 @@ class TerminalWindow(QMainWindow):
         self.send_btn.clicked.connect(self._on_send)
         input_row.addWidget(self.send_btn)
 
+        input_row.setContentsMargins(0, 0, 0, 0)
+        input_row.setSpacing(8)
+
         layout.addLayout(input_row)
 
         # 状态卡片（紧凑）
         cards_row = QHBoxLayout()
         cards_row.setSpacing(10)
         self.task_card = StatusCard("当前任务", "📋")
-        self.memory_card = StatusCard("最近记忆", "🧠")
         cards_row.addWidget(self.task_card, 1)
-        cards_row.addWidget(self.memory_card, 1)
+        self.reminder_card = StatusCard("待触发提醒", "⏰")
+        cards_row.addWidget(self.reminder_card, 1)
         layout.addLayout(cards_row)
 
         layout.addStretch()
@@ -739,79 +734,6 @@ class TerminalWindow(QMainWindow):
         layout.addLayout(input_row)
 
         return panel
-
-    # ---------- 记忆面板 ----------
-    def _build_memory_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
-
-        title = QLabel("🧠 记忆")
-        title.setStyleSheet("color: #00f5ff; font-size: 18px; font-weight: bold;")
-        layout.addWidget(title)
-
-        btn_row = QHBoxLayout()
-        refresh_btn = QPushButton("🔄 刷新历史")
-        refresh_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        refresh_btn.setStyleSheet(self._btn_style())
-        refresh_btn.clicked.connect(self.history_requested.emit)
-        btn_row.addWidget(refresh_btn)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        self.history_list = QListWidget()
-        self.history_list.setStyleSheet("""
-            QListWidget {
-                background-color: rgba(2, 8, 20, 0.7);
-                border: 1px solid rgba(0, 245, 255, 0.2);
-                border-radius: 10px;
-                color: #e9fbff;
-                font-size: 13px;
-                padding: 6px;
-            }
-            QListWidget::item {
-                padding: 8px;
-                border-bottom: 1px solid rgba(0, 245, 255, 0.1);
-            }
-            QListWidget::item:selected {
-                background-color: rgba(0, 245, 255, 0.15);
-            }
-        """)
-        layout.addWidget(self.history_list, 1)
-
-        # 回溯控制
-        back_row = QHBoxLayout()
-        back_row.addWidget(QLabel("回溯到第"))
-        self.backtrack_spin = QLineEdit("0")
-        self.backtrack_spin.setFixedWidth(60)
-        self.backtrack_spin.setStyleSheet("""
-            QLineEdit {
-                background-color: rgba(2, 8, 20, 0.96);
-                border: 1px solid rgba(0, 245, 255, 0.35);
-                border-radius: 6px;
-                padding: 4px 8px;
-                color: #e9fbff;
-            }
-        """)
-        back_row.addWidget(self.backtrack_spin)
-        back_row.addWidget(QLabel("条记录"))
-        back_btn = QPushButton("🕘 回溯")
-        back_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        back_btn.setStyleSheet(self._btn_style())
-        back_btn.clicked.connect(self._on_backtrack)
-        back_row.addWidget(back_btn)
-        back_row.addStretch()
-        layout.addLayout(back_row)
-
-        return panel
-
-    def _on_backtrack(self):
-        try:
-            keep = int(self.backtrack_spin.text())
-            self.backtrack_requested.emit(keep)
-        except ValueError:
-            pass
 
     # ---------- 任务面板 ----------
     def _build_task_panel(self) -> QWidget:
@@ -978,11 +900,28 @@ class TerminalWindow(QMainWindow):
         gl.addWidget(QLabel("模型:"), 0, 0)
         self.llm_model = QLineEdit("qwen2.5:7b")
         self.llm_model.setStyleSheet(self._input_style())
+        self.llm_model.setPlaceholderText("本地：qwen2.5:3b / 云端：cloud:gpt-4o-mini / agnes-3.0-flash")
         gl.addWidget(self.llm_model, 0, 1)
         gl.addWidget(QLabel("API 地址:"), 1, 0)
         self.llm_url = QLineEdit("http://127.0.0.1:11434/api/chat")
         self.llm_url.setStyleSheet(self._input_style())
         gl.addWidget(self.llm_url, 1, 1)
+        # ── 通用云端 OpenAI 兼容录入（model 填 cloud:<模型名> 时走 base_url + key + model 三件套）──
+        gl.addWidget(QLabel("云端 Key:"), 2, 0)
+        self.cloud_api_key = QLineEdit("")
+        self.cloud_api_key.setStyleSheet(self._input_style())
+        self.cloud_api_key.setPlaceholderText("OpenAI/通义/DeepSeek 等 Bearer token，如 sk-...")
+        gl.addWidget(self.cloud_api_key, 2, 1)
+        gl.addWidget(QLabel("云端 URL:"), 3, 0)
+        self.cloud_base_url = QLineEdit("")
+        self.cloud_base_url.setStyleSheet(self._input_style())
+        self.cloud_base_url.setPlaceholderText("如 https://api.openai.com/v1 或 dashscope compatible-mode/v1")
+        gl.addWidget(self.cloud_base_url, 3, 1)
+        gl.addWidget(QLabel("云端模型:"), 4, 0)
+        self.cloud_model = QLineEdit("")
+        self.cloud_model.setStyleSheet(self._input_style())
+        self.cloud_model.setPlaceholderText("如 gpt-4o-mini / qwen-turbo / deepseek-chat")
+        gl.addWidget(self.cloud_model, 4, 1)
         layout.addWidget(llm_group)
 
         # 语音设置
@@ -1122,7 +1061,7 @@ class TerminalWindow(QMainWindow):
         show_act.triggered.connect(self.showNormal)
         menu.addSeparator()
         quit_act = menu.addAction("❌ 退出")
-        quit_act.triggered.connect(QApplication.instance().quit)
+        quit_act.triggered.connect(self._force_quit)
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.activated.connect(self._on_tray_activated)
         self.tray_icon.show()
@@ -1137,6 +1076,11 @@ class TerminalWindow(QMainWindow):
         self.hide()
         self.tray_icon.showMessage("达妮娅终端", "已最小化到托盘", QSystemTrayIcon.MessageIcon.Information, 1500)
 
+    def _force_quit(self):
+        """托盘菜单「退出」：强制终止整个应用"""
+        self.close()  # 关闭主窗口（会触发 closeEvent → hide）
+        sys.exit(0)
+
     # ---------- 消息发送 ----------
     def _on_send(self):
         text = self.input_box.text().strip()
@@ -1144,6 +1088,61 @@ class TerminalWindow(QMainWindow):
             return
         self.input_box.clear()
         self._handle_send(text)
+
+    # ---------- 麦克风语音输入（按住空格开始，松开识别；识别中可打断） ----------
+    def _on_voice_input_result(self, text: str):
+        """识别结果 / 打断后清空：写入输入框，用户可编辑后再发送"""
+        self._mic_recognizing = False
+        self._mic_recording = False
+        self._mic_space_trigger = False
+        if text:
+            self.input_box.setText(text)
+            self.input_box.setFocus()
+            self.input_box.selectAll()
+
+    def _focus_in_text_input(self) -> bool:
+        """当前焦点是否在文本输入框（避免空格触发录音干扰打字）"""
+        w = QApplication.focusWidget()
+        if w is None:
+            w = QApplication.focusWindow()
+        # 焦点在文本输入控件本身
+        if isinstance(w, (QLineEdit, QTextEdit)):
+            return True
+        # 焦点在包含文本输入框的窗口，但焦点控件不是输入框本身
+        # 例如文本选中/编辑态下，焦点可能暂时留在窗口而非控件，此时也要拦截空格
+        if hasattr(w, "findChildren"):
+            for child in list(w.findChildren(QLineEdit)) + list(w.findChildren(QTextEdit)):
+                if child.isVisible() and child.hasFocus():
+                    return True
+                if child.hasFocus() and hasattr(child, "textCursor") and child.textCursor().hasSelection():
+                    return True
+        return False
+
+    def eventFilter(self, obj, event):
+        """全局监听空格键：按住开始录音，松开结束并识别；识别中时空格可打断"""
+        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Space:
+            if not event.isAutoRepeat():
+                if self._mic_recognizing:
+                    # 识别中按空格：打断识别
+                    self._mic_recognizing = False
+                    self.voice_input_cancelled.emit()
+                    return True
+                if not self._mic_recording and not self._focus_in_text_input():
+                    # 空闲且不在输入框中：开始录音
+                    self._mic_recording = True
+                    self._mic_recognizing = False
+                    self._mic_space_trigger = True
+                    self.voice_input_started.emit()
+                    return True
+        elif event.type() == QEvent.KeyRelease and event.key() == Qt.Key_Space:
+            if not event.isAutoRepeat() and self._mic_recording and self._mic_space_trigger:
+                # 松开空格：结束录音并识别
+                self._mic_recording = False
+                self._mic_space_trigger = False
+                self._mic_recognizing = True
+                self.voice_input_stopped.emit()
+                return True
+        return super().eventFilter(obj, event)
 
     def _on_send_chat(self):
         text = self.chat_input.text().strip()
@@ -1156,6 +1155,12 @@ class TerminalWindow(QMainWindow):
         # 添加用户气泡
         self._append_message(text, is_user=True)
         self.chat_message_sent.emit(text)
+
+    def _append_user_message(self, text: str):
+        """语音识别出的用户文本 → 回显为用户气泡"""
+        text = (text or "").strip()
+        if text:
+            self._append_message(text, is_user=True)
 
     # ---------- 聊天消息渲染 ----------
     def _append_message(self, text: str, is_user: bool):
@@ -1302,23 +1307,31 @@ class TerminalWindow(QMainWindow):
     def update_task_card(self, text: str):
         self.task_card.set_content(text)
 
-    def update_memory_card(self, text: str):
-        self.memory_card.set_content(text)
-
-    def populate_history(self, history: list):
-        self.history_list.clear()
-        for i, item in enumerate(history):
-            if isinstance(item, dict):
-                role = item.get("role", "")
-                content = item.get("content", "")
-                prefix = "你: " if role == "user" else "达妮娅: "
-            elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                prefix = "你: "
-                content = f"{item[0]}  →  {item[1]}"
+    def update_reminder_card(self, reminders: list):
+        """提醒卡片：展示待触发的提醒列表（按时间排序）"""
+        if not reminders:
+            self.reminder_card.set_content("暂无")
+            return
+        lines = []
+        now = datetime.now()
+        for r in reminders[:3]:
+            fire = r.get("fire_at")
+            if isinstance(fire, datetime):
+                delta = (fire - now).total_seconds()
+                if delta <= 0:
+                    when = "即将到点"
+                elif delta < 60:
+                    when = "不到1分钟"
+                elif delta < 3600:
+                    when = f"{int(delta // 60)}分钟后"
+                elif delta < 86400:
+                    when = f"{int(delta // 3600)}小时{int((delta % 3600) // 60)}分后"
+                else:
+                    when = f"{int(delta // 86400)}天后"
             else:
-                prefix = ""
-                content = str(item)
-            self.history_list.addItem(f"[{i}] {prefix}{content[:80]}")
+                when = r.get("desc", "")
+            lines.append(f"{when} · {r.get('content', '')}")
+        self.reminder_card.set_content("\n".join(lines))
 
     def populate_tasks(self, tasks: list):
         self.task_list.clear()

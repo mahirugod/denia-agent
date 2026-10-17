@@ -1,0 +1,8 @@
+# 模型检测技能
+name: model_detect
+description: 检测本地 Ollama 模型库（models 文件夹）中有哪些模型可用
+version: "1.0"
+tools: ["model_detect"]
+depends: []
+min_harness: tiny
+disabled: false

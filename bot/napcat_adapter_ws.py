@@ -18,7 +18,6 @@ _MSG_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="msg_handler")
 
 
 from denia_chatbot import DeniaChatbot
-from voice_synthesizer import VoiceSynthesizer
 from config_napcat import *
 
 try:
@@ -26,12 +25,6 @@ try:
     HAS_IMAGE_RECOGNITION = True
 except ImportError:
     HAS_IMAGE_RECOGNITION = False
-
-try:
-    from voice_recognizer import process_voice_message
-    HAS_VOICE_RECOGNITION = True
-except ImportError:
-    HAS_VOICE_RECOGNITION = False
 
 try:
     from personality import get_personality_system
@@ -44,9 +37,6 @@ bots: dict[str, DeniaChatbot] = {}
 _bot_last_used: dict[str, float] = {}  # 记录每个 bot 最后使用时间
 _MAX_BOTS = 50  # 最大 bot 实例数量
 _BOT_TTL = 3600  # bot 空闲超过1小时清理
-
-# 全局语音合成器
-voice_synthesizer = VoiceSynthesizer()
 
 # 回复频率控制
 _last_reply_time = {"private": {}, "group": {}}  # 记录每个用户/群最后回复时间
@@ -155,33 +145,22 @@ def _is_voice_only(raw_msg: str) -> bool:
 
 
 def _handle_voice_only_message(chat_type: str, chat_id: int, user_id: int):
-    """处理纯语音消息（无文字）"""
-    if HAS_VOICE_RECOGNITION:
-        # 用 Whisper 转写语音
-        send_text = f"[语音识别] 正在听你说话...（首次加载模型可能需要1-2分钟）"
-        if chat_type == "private":
-            send_private_msg(user_id, send_text)
-        else:
-            send_group_msg(chat_id, send_text)
-        return None  # 返回 None 表示由上层处理转写结果
+    """处理纯语音消息（无文字）—— 发提示让用户打字，不发语音条"""
+    voice_replies = [
+        "嗯……你发了一条语音呢……但我现在还听不懂语音……",
+        "啊……语音吗……抱歉我现在只能看懂文字和图片呢……",
+        "唔……你发的语音我听不到啦……能不能打字告诉我呀……",
+        "对不起……我还不会听语音呢……打字和我说话吧……",
+    ]
+    reply = random.choice(voice_replies)
+    print(f"[语音] 收到语音消息（无识别模块），回复提示")
+    if chat_type == "private":
+        send_private_msg(user_id, reply)
+        _last_reply_time["private"][user_id] = time.time()
     else:
-        # 无 Whisper，发提示
-        voice_replies = [
-            "嗯……你发了一条语音呢……但我现在还听不懂语音……",
-            "啊……语音吗……抱歉我现在只能看懂文字和图片呢……",
-            "唔……你发的语音我听不到啦……能不能打字告诉我呀……",
-            "对不起……我还不会听语音呢……打字和我说话吧……",
-        ]
-        reply = random.choice(voice_replies)
-        print(f"[语音] 收到语音消息（无识别模块），回复提示")
-        voice_cq = voice_synthesizer.speak(reply)
-        if chat_type == "private":
-            send_private_msg(user_id, reply, voice_cq)
-            _last_reply_time["private"][user_id] = time.time()
-        else:
-            send_group_msg(chat_id, reply, voice_cq)
-            _last_reply_time["group"][chat_id] = time.time()
-        return "SKIP"  # 告诉上层跳过后续处理
+        send_group_msg(chat_id, reply)
+        _last_reply_time["group"][chat_id] = time.time()
+    return "SKIP"  # 告诉上层跳过后续处理
 
 
 def should_reply(chat_type: str, chat_id: int, is_mentioned: bool, has_image: bool) -> bool:
@@ -260,30 +239,10 @@ def process_message(data: dict):
         has_image = '[CQ:image' in raw_msg
         has_voice = '[CQ:record' in raw_msg or '[CQ:voice' in raw_msg
 
-        # 语音消息处理
-        voice_transcribed = False
+        # 语音消息处理：纯语音 → 提示打字（不再做 Whisper 转写，不发语音条）
         if has_voice and _is_voice_only(raw_msg):
             result = _handle_voice_only_message("private", chat_id=user_id, user_id=user_id)
             if result == "SKIP":
-                return
-            # Whisper 转写
-            voice_text = None
-            if HAS_VOICE_RECOGNITION:
-                try:
-                    voice_text = process_voice_message(raw_msg)
-                except Exception as e:
-                    print(f"[语音识别] 处理失败: {e}")
-                    import traceback
-                    traceback.print_exc()
-            if voice_text:
-                text = f"[用户发送了一条语音，内容: {voice_text}]"
-                voice_transcribed = True
-                print(f"[语音识别] 转写成功，继续处理")
-            else:
-                fail_reply = "唔……你的语音我没太听清呢……能不能再说一次或者打字告诉我呀……"
-                voice_cq = voice_synthesizer.speak(fail_reply)
-                send_private_msg(user_id, fail_reply, voice_cq)
-                _last_reply_time["private"][user_id] = time.time()
                 return
 
         # 频率限制检查
@@ -302,8 +261,6 @@ def process_message(data: dict):
         display_text = text or ""
         if image_desc:
             print(f"[识图] 识别结果: {image_desc[:80]}...")
-        elif voice_transcribed:
-            display_text = text  # 语音转写结果已在 text 中
 
         print(f"[私聊] ← {user_id}: {display_text[:80]}...")
         try:
@@ -313,8 +270,8 @@ def process_message(data: dict):
                 bot.llm.user_id = user_id
             reply = bot.get_response(display_text, play_voice=False, image_desc=image_desc)
             _last_reply_time["private"][user_id] = time.time()
-            voice_cq = voice_synthesizer.speak(reply)
-            send_private_msg(user_id, reply, voice_cq)
+            # 语音功能已关闭：只发文字，不合成语音条
+            send_private_msg(user_id, reply)
         except Exception as e:
             print(f"[错误] 处理私聊消息失败: {e}")
             import traceback
@@ -332,26 +289,9 @@ def process_message(data: dict):
         is_mentioned = f"[CQ:at,qq={self_id}]" in raw_msg
 
         # 语音消息处理（群聊中仅处理被@时的纯语音）
-        voice_transcribed = False
         if has_voice and _is_voice_only(raw_msg) and is_mentioned:
             result = _handle_voice_only_message("group", chat_id=group_id, user_id=user_id)
             if result == "SKIP":
-                return
-            voice_text = None
-            if HAS_VOICE_RECOGNITION:
-                try:
-                    voice_text = process_voice_message(raw_msg)
-                except Exception as e:
-                    print(f"[语音识别] 处理失败: {e}")
-            if voice_text:
-                text = f"[用户发送了一条语音，内容: {voice_text}]"
-                voice_transcribed = True
-                print(f"[语音识别] 群聊转写成功，继续处理")
-            else:
-                fail_reply = "唔……语音没太听清呢……打字告诉我吧……"
-                voice_cq = voice_synthesizer.speak(fail_reply)
-                send_group_msg(group_id, fail_reply, voice_cq)
-                _last_reply_time["group"][group_id] = time.time()
                 return
 
         # 频率限制检查（被@或有图片时跳过限流）
@@ -370,8 +310,6 @@ def process_message(data: dict):
         display_text = text or ""
         if image_desc:
             print(f"[识图] 识别结果: {image_desc[:80]}...")
-        elif voice_transcribed:
-            display_text = text  # 语音转写结果已在 text 中
 
         group_id = data.get('group_id')
         print(f"[群聊] ← 群{group_id} 用户{user_id}: {display_text[:80]}...")
@@ -382,8 +320,8 @@ def process_message(data: dict):
                 bot.llm.user_id = group_id
             reply = bot.get_response(display_text, play_voice=False, image_desc=image_desc)
             _last_reply_time["group"][group_id] = time.time()
-            voice_cq = voice_synthesizer.speak(reply)
-            send_group_msg(group_id, reply, voice_cq)
+            # 语音功能已关闭：只发文字
+            send_group_msg(group_id, reply)
         except Exception as e:
             print(f"[错误] 处理群聊消息失败: {e}")
             import traceback
@@ -440,8 +378,7 @@ if __name__ == "__main__":
     print(f"  NapCat HTTP API: {NAPCAT_HTTP_URL}")
     print("  群聊模式: 见话就接")
     print(f"  回复限流: 群聊{REPLY_PROBABILITY_GROUP*100:.0f}%/冷{REPLY_COOLDOWN_GROUP}s, 私聊{REPLY_PROBABILITY_PRIVATE*100:.0f}%/冷{REPLY_COOLDOWN_PRIVATE}s")
-    print("  语音模式: 发送语音条")
-    print(f"  语音识别: {'Whisper ' + ('base' if HAS_VOICE_RECOGNITION else '') + ' (已启用)' if HAS_VOICE_RECOGNITION else '未启用'}")
+    print("  语音模式: 已关闭（只发文字）")
     print(f"  图片识别: {'已启用' if HAS_IMAGE_RECOGNITION else '未启用'}")
     print(f"  主动互动: {'已启用' if HAS_PERSONALITY else '未启用'}")
     print("=" * 50)
@@ -465,8 +402,8 @@ if __name__ == "__main__":
                         if active_users:
                             user_id = random.choice(active_users)
                             message = personality.get_initiation_line()
-                            voice_cq = voice_synthesizer.speak(message)
-                            send_private_msg(user_id, message, voice_cq)
+                            # 语音功能已关闭：只发文字
+                            send_private_msg(user_id, message)
                             print(f"[主动互动] → {user_id}: {message}")
                 except Exception as e:
                     print(f"[主动互动错误] {e}")
