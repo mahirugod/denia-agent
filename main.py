@@ -386,9 +386,8 @@ class TerminalApp(QObject):
             self.window.auto_start.setChecked(value.lower() == "true")
             self._save_settings()
         elif key in ("cloud_api_key", "cloud_base_url", "cloud_model",
-                      "llm_url", "llm_api_key",
-                      "agnes_api_key", "agnes_base_url", "agnes_model"):
-            # 模型配置项（通用云端 / 本地推理后端 / ags 云端）：直接写 settings.json
+                      "llm_url", "llm_api_key"):
+            # 模型配置项（通用云端 / 本地推理后端）：直接写 settings.json
             # 其中 llm_url / 云端三项 改完需要重新初始化 LLM 才生效
             self._settings[key] = value
             try:

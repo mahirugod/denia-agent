@@ -2,7 +2,7 @@
 
 有一些功能的 agent，帮助你完成一些事情。
 
-**达妮娅终端**是一个 Windows 桌面 AI 陪伴应用：一个住在你电脑里的角色「达妮娅」，可以聊天、说话（GPT-SoVITS 定制音色）、帮你定时提醒、打开应用、看屏幕，还能通过 NapCat 以 QQ 机器人的形式陪聊。所有对话、语音、知识库全部本地运行，不依赖任何云端 API。
+**达妮娅终端**是一个 Windows 桌面 AI 陪伴应用：一个住在你电脑里的角色「达妮娅」，可以聊天、说话（GPT-SoVITS 定制音色）、帮你定时提醒、打开应用、看屏幕，还能通过 NapCat 以 QQ 机器人的形式陪聊。支持本地模型（Ollama 可选）与云端模型（ags / 任意 OpenAI 兼容）两条路由，语音、知识库、工具全部本地运行，LLM 可按需选择本地或云端。
 
 ## 功能特性
 
@@ -148,11 +148,33 @@ pythonw main.py
 不想用本地推理后端时，可直接用云端模型，**完全不依赖 Ollama**：
 
 - **ags 模型**（`model_name` 形如 `agnes-3.0-flash`，以 `agnes` 开头）：
-  读取 `settings.json` 的 `agnes_api_key` / `agnes_base_url`（默认 `https://apihub.agnes-ai.com/v1`）/ `agnes_model` 三件套，直接在设置页填入即可。
-- **通用云端模型**（`model_name` 形如 `cloud:<model>`，或等于 `settings.json` 里的 `cloud_model`）：
-  读取 `cloud_api_key` / `cloud_base_url` / `cloud_model` 三件套，支持任意 OpenAI 兼容接口。
+  读取 `settings.json` 的 `cloud_api_key` / `cloud_base_url`，模型名直接用 `model_name`，直接在设置页填入即可。
+- **通用云端模型**（`model_name` 形如 `cloud:<model>`）：
+  同样读取 `cloud_api_key` / `cloud_base_url`，模型名用 `model_name` 去掉 `cloud:` 前缀，支持任意 OpenAI 兼容接口。
 
 切到云端模型后，Ollama 服务不会被拉起，主动巡检也不会检查本地推理后端状态。
+
+## 用户画像（自动记忆）
+
+- 达妮娅会通过对话**自动学习**你的城市、昵称、喜好、作息等，存到 `bot/data/user_profile.json`
+- 学习到的画像会注入 system prompt，让她回答更贴合你（如查天气自动用你所在的城市）
+- **仅云端大模型生效**：本地小模型（Ollama 3B 级）上下文有限，画像注入会自动跳过，避免撑爆 4K 窗口
+- 想手动预填或修改，直接编辑 `bot/data/user_profile.json`（字段见文件内注释）
+
+## 天气查询自动补城市
+
+- 你说"今天下雨吗"但没带城市时，达妮娅会自动补上你画像里的城市（没有就回落 `settings.json` 的 `weather_city`）
+- 搜索结果里的旧日期不会误导"今天/明天"的判断——当前日期始终以系统注入的时间为准
+
+## TTS 读法优化
+
+- 温度会按口语读出来：`15~23℃` → "十五到二十三摄氏度"，`-1℃` → "零下一度"
+- 由 `bot/voice/engine_adapters.py` 的 `normalize_for_tts` 统一处理
+
+## 敏感文件说明
+
+- `settings.json` 含你的 API Key，**不入库**（已 gitignore）
+- 仓库提供脱敏模板 `settings.template.json`（Key 留空），新使用者复制为 `settings.json` 后填入自己的 Key 即可
 
 ## 说明
 

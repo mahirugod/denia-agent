@@ -129,8 +129,7 @@ class DeniaLLM:
         self.max_history_length = 6  # 最大历史记录长度（3B小模型，不宜太多）
 
         # ── 云端通用 OpenAI 兼容配置（任意 base_url + key，从 settings.json 读取）──
-        # 设置页 ags 与通用云端共用一组 cloud_api_key / cloud_base_url；
-        # 兼容历史字段 agnes_api_key / agnes_base_url（若 cloud_* 未填则回落）
+        # 设置页 ags 与通用云端共用一组 cloud_api_key / cloud_base_url
         # 模型名统一取 model_name（ags 路由时即 model_name，通用云端时即 cloud:<name>）
         self.cloud_api_key = os.getenv("CLOUD_API_KEY", "")
         self.cloud_base_url = os.getenv("CLOUD_BASE_URL", "")
@@ -140,33 +139,14 @@ class DeniaLLM:
             if _os.path.exists(_settings_path):
                 with open(_settings_path, "r", encoding="utf-8") as _f:
                     _cfg = _json.load(_f)
-                # cloud_* 优先，未填时回落 agnes_*
                 if _cfg.get("cloud_api_key"):
                     self.cloud_api_key = _cfg["cloud_api_key"]
-                elif _cfg.get("agnes_api_key"):
-                    self.cloud_api_key = _cfg["agnes_api_key"]
                 if _cfg.get("cloud_base_url"):
                     self.cloud_base_url = _cfg["cloud_base_url"]
-                elif _cfg.get("agnes_base_url"):
-                    self.cloud_base_url = _cfg["agnes_base_url"]
         except Exception:
             pass
-        # ags 与通用云端共用 cloud_* 凭据；保留 agnes_* 作为历史字段，未填时回落 cloud_*
-        self.agnes_api_key = self.cloud_api_key
-        self.agnes_base_url = self.cloud_base_url or "https://apihub.agnes-ai.com/v1"
-        # ags 路由：model 字段优先用 settings.json 里的 agnes_model（ags API 专用模型名），没有则回落 model_name
-        _ags_model_from_cfg = ""
-        try:
-            import os as _os, json as _json
-            _sp = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "settings.json")
-            if _os.path.exists(_sp):
-                with open(_sp, "r", encoding="utf-8") as _f:
-                    _cfg2 = _json.load(_f)
-                _ags_model_from_cfg = _cfg2.get("agnes_model", "")
-        except Exception:
-            pass
-        self.agnes_model = _ags_model_from_cfg or model_name  # ags 路由时 model 字段
-        self.cloud_model = model_name   # 通用云端路由时 model 字段直接用 model_name
+        # ags 与通用云端共用 cloud_* 凭据；ags 模型名直接用 model_name
+        self.cloud_model = model_name
         self._is_agnes = self.model_name.startswith("agnes")
         # 通用云端：model_name 形如 "cloud:<model>"
         self._is_cloud = self.model_name.startswith("cloud:")
@@ -634,14 +614,14 @@ class DeniaLLM:
             )
 
             # 构建请求（ags 是 OpenAI 兼容，但参数从简避免被拒）
-            url = f"{self.agnes_base_url}/chat/completions"
+            url = f"{self.cloud_base_url}/chat/completions"
             headers = {
-                "Authorization": f"Bearer {self.agnes_api_key}",
+                "Authorization": f"Bearer {self.cloud_api_key}",
                 "Content-Type": "application/json",
             }
 
             data = {
-                "model": self.agnes_model,
+                "model": self.cloud_model,
                 "messages": messages,
                 "temperature": 0.7,
                 "max_tokens": 256,
@@ -660,7 +640,7 @@ class DeniaLLM:
             self.update_history("assistant", reply)
             self._yawn_hint = ""
 
-            print(f"[ags] {self.agnes_model} 回复成功 ({len(reply)}字)")
+            print(f"[ags] {self.cloud_model} 回复成功 ({len(reply)}字)")
             return reply
 
         except requests.exceptions.Timeout:
@@ -677,9 +657,9 @@ class DeniaLLM:
     def _stream_agnes(self, messages, on_sentence=None, on_delta=None):
         import json, requests, re
         try:
-            url = f"{self.agnes_base_url}/chat/completions"
-            headers = {"Authorization": f"Bearer {self.agnes_api_key}", "Content-Type": "application/json"}
-            data = {"model": self.agnes_model, "messages": messages, "temperature": 0.7, "max_tokens": 256, "stream": True}
+            url = f"{self.cloud_base_url}/chat/completions"
+            headers = {"Authorization": f"Bearer {self.cloud_api_key}", "Content-Type": "application/json"}
+            data = {"model": self.cloud_model, "messages": messages, "temperature": 0.7, "max_tokens": 256, "stream": True}
             resp = requests.post(url, headers=headers, json=data, timeout=60, stream=True)
             resp.raise_for_status()
             display_full = ""

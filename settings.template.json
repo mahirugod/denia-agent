@@ -3,10 +3,7 @@
   "auto_start": true,
   "weather_city": "天津",
   "mcp_servers": {},
-  "model_name": "qwen2.5:3b",
-  "agnes_api_key": "",
-  "agnes_base_url": "https://apihub.agnes-ai.com/v1",
-  "agnes_model": "agnes-3.0-flash",
+  "model_name": "agnes-3.0-flash",
   "cloud_api_key": "",
-  "cloud_base_url": ""
+  "cloud_base_url": "https://api.agnes-ai.cn/v1"
 }

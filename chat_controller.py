@@ -115,12 +115,8 @@ class ChatController(QObject):
                                 _scfg = json.load(_f)
                             if not llm_api_key and _scfg.get("cloud_api_key"):
                                 llm_api_key = _scfg["cloud_api_key"]
-                            if not llm_api_key and _scfg.get("agnes_api_key"):
-                                llm_api_key = _scfg["agnes_api_key"]
                             if not llm_base_url and _scfg.get("cloud_base_url"):
                                 llm_base_url = _scfg["cloud_base_url"]
-                            if not llm_base_url and _scfg.get("agnes_base_url"):
-                                llm_base_url = _scfg["agnes_base_url"]
                     except Exception:
                         pass
             self._llm_base_url = llm_base_url or self._llm_base_url
