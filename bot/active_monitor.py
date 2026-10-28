@@ -16,51 +16,10 @@
     - recovery        Ollama 恢复了（之前 down 现在 alive）
 """
 import os
-import socket
-import subprocess
 from datetime import datetime
 from typing import Optional, Callable, List
 
-try:
-    from skills.system_sense import _check_ollama, _check_disk, _time_event, _pending_reminders
-except Exception:
-    # 兜底：手动实现（防止 skills 加载顺序问题）
-    def _check_ollama():
-        port = 11434
-        alive = False
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1.0)
-            s.connect(("127.0.0.1", port))
-            s.close()
-            alive = True
-        except Exception:
-            alive = False
-        return {"alive": alive, "process_running": False}
-
-    def _check_disk():
-        import shutil
-        out = []
-        for drive in ["C:", "D:"]:
-            try:
-                du = shutil.disk_usage(drive + "\\")
-                out.append({"drive": drive, "free_gb": round(du.free / 1024**3, 1),
-                            "total_gb": round(du.total / 1024**3, 1),
-                            "free_pct": round(du.free / du.total * 100, 1)})
-            except Exception:
-                pass
-        return out
-
-    def _time_event():
-        h = datetime.now().hour
-        return {"slot": "evening", "greet": "晚上好", "hour": h}
-
-    def _pending_reminders():
-        try:
-            from skills import get_active_reminders
-            return len(get_active_reminders())
-        except Exception:
-            return 0
+from system_probe import check_disk, check_ollama, pending_reminders
 
 
 # 去重记忆：key → 上次告警时间戳（避免同一异常反复弹）
@@ -140,7 +99,7 @@ class ActiveMonitor:
         # 1. Ollama 状态（仅当 Ollama 巡检开关打开时才执行，云端/ags 模型不巡检本地推理后端）
         if self._ollama_enabled:
             try:
-                ol = _check_ollama()
+                ol = check_ollama()
                 alive = ol.get("alive", False)
                 proc_running = ol.get("process_running", False)
                 global _LAST_OLLAMA_ALIVE
@@ -167,7 +126,7 @@ class ActiveMonitor:
 
         # 2. 磁盘
         try:
-            low = [d for d in _check_disk() if d.get("free_pct") is not None and d["free_pct"] < 10]
+            low = [d for d in check_disk() if d.get("free_pct") is not None and d["free_pct"] < 10]
             if low:
                 if _should_alert("disk_low", cooldown=3600):  # 1 小时只报一次
                     lines = "、".join(f"{d['drive']} 剩 {d['free_gb']} GB" for d in low)
@@ -181,7 +140,7 @@ class ActiveMonitor:
 
         # 3. 待办提醒
         try:
-            n = _pending_reminders()
+            n = pending_reminders()
             if n > 0:
                 # 只报数量增加的情况：用 _ALERT_DEDUP 记录上次数量
                 last_n = _ALERT_DEDUP.get("_pending_count", 0)

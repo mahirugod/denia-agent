@@ -17,25 +17,22 @@ from typing import Optional, Dict
 
 class PersonalitySystem:
     """角色个性系统"""
-    
+
     def __init__(self):
         self._data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "personality.json")
         self._load_data()
-        
+
         # 当前话题追踪
         self._current_topic = ""
         self._topic_history = []
+        # 话题持久化（跨重启继承，供"帮我搜"等短 query 继承上一轮话题）
+        self._topic_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "last_topic.json")
+        self._load_persisted_topic()
+        # 话题写盘防抖（高频 update_topic 只落盘一次）
+        self._topic_save_timer = None
         
-        # 对话状态
+        # 对话状态（仅用于记录，不再驱动主动搭话）
         self._last_chat_time = time.time()
-        self._active_lines = [
-            "呼呼...你在忙什么呢？",
-            "有点无聊呢...陪我说说话吧~",
-            "（伸懒腰）你还好吗？",
-            "今天过得怎么样呀？",
-            "要不要聊聊什么呢？",
-            "有点想找人说话呢...",
-        ]
         
     def _load_data(self):
         """加载个性数据"""
@@ -44,13 +41,7 @@ class PersonalitySystem:
                 self._data = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             self._data = {
-                "greetings": {
-                    "morning": ["呼呼...早上好...好困啊...", "嗯...早安呢...", "哈啊——早上好...", "早上好呀~"],
-                    "noon": ["中午好~", "要一起午睡吗？", "午饭吃了吗？", "中午好呀~"],
-                    "afternoon": ["下午好呢~", "今天过得怎么样？", "下午好呀~"],
-                    "evening": ["晚上好~", "今晚想吃什么？", "晚上好呀~"],
-                    "night": ["夜深了呢...", "要早点休息哦...", "晚安呢..."]
-                },
+                "greetings": {},
                 "weather_reactions": {
                     "sunny": ["天气真好呀！", "阳光好温暖呢~", "适合出门走走呢~"],
                     "rainy": ["下雨天适合睡觉呢...", "雨声真好听...", "记得带伞哦~"],
@@ -68,23 +59,6 @@ class PersonalitySystem:
             json.dump(self._data, f, ensure_ascii=False, indent=2)
     
     # ========== 时间感知 ==========
-    
-    def get_time_greeting(self) -> str:
-        """根据时间返回问候语"""
-        hour = datetime.now().hour
-        
-        if 5 <= hour < 9:
-            return random.choice(self._data["greetings"]["morning"])
-        elif 9 <= hour < 12:
-            return random.choice(self._data["greetings"]["morning"])
-        elif 12 <= hour < 14:
-            return random.choice(self._data["greetings"]["noon"])
-        elif 14 <= hour < 18:
-            return random.choice(self._data["greetings"]["afternoon"])
-        elif 18 <= hour < 22:
-            return random.choice(self._data["greetings"]["evening"])
-        else:
-            return random.choice(self._data["greetings"]["night"])
     
     def get_time_hint(self) -> str:
         """生成时间相关提示词"""
@@ -128,10 +102,42 @@ class PersonalitySystem:
         
         return ""
     
+    def _load_persisted_topic(self):
+        """启动时从上次的持久化文件恢复话题"""
+        try:
+            if os.path.exists(self._topic_file):
+                with open(self._topic_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self._current_topic = data.get("topic", "") or ""
+                    self._topic_history = data.get("history", []) or []
+                    if self._current_topic:
+                        print(f"[话题] 恢复上一轮话题: {self._current_topic}")
+        except Exception as e:
+            print(f"[话题] 恢复话题失败: {e}")
+
+    def _save_persisted_topic(self):
+        """把当前话题 + 历史持久化到磁盘（跨重启继承）"""
+        try:
+            os.makedirs(os.path.dirname(self._topic_file), exist_ok=True)
+            with open(self._topic_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"topic": self._current_topic, "history": self._topic_history},
+                    f, ensure_ascii=False, indent=2,
+                )
+        except Exception as e:
+            print(f"[话题] 保存话题失败: {e}")
+
     # ========== 话题延续 ==========
-    
+
     def update_topic(self, user_input: str):
         """更新当前话题"""
+        # 纯确认词/回应词（"可以"、"好的"、"嗯"等）不更新话题，避免污染话题继承
+        import re
+        _CONFIRM_ONLY = re.compile(
+            r'^[，。！!??\s]*(可以|好的|好的呀|好呀|行|嗯|嗯嗯|对|对的|是的|没问题|知道了|了解|收到|明白|明白啦|好嘞|ok|OK)[，。！!??\s]*$'
+        )
+        if _CONFIRM_ONLY.match(user_input.strip()):
+            return
         keywords = self._extract_keywords(user_input)
         if keywords:
             topic = "".join(keywords[:2])
@@ -139,11 +145,25 @@ class PersonalitySystem:
                 self._current_topic = topic
                 self._topic_history.append(topic)
                 self._topic_history = self._topic_history[-5:]
+                self._schedule_topic_save()
+
+    def _schedule_topic_save(self):
+        """防抖写盘：1.5s 内多次 update_topic 只落盘一次"""
+        import threading
+        if self._topic_save_timer is not None:
+            self._topic_save_timer.cancel()
+        self._topic_save_timer = threading.Timer(1.5, self._save_persisted_topic)
+        self._topic_save_timer.daemon = True
+        self._topic_save_timer.start()
     
     def get_topic_continuation(self) -> Optional[str]:
         """获取话题延续提示（已禁用，避免回答过于发散）"""
         return None
-    
+
+    def get_last_topic(self) -> str:
+        """取上一轮记住的话题（纯指令型短 query 时用来继承检索实体）"""
+        return self._current_topic or ""
+
     def _extract_keywords(self, text: str) -> list:
         """从文本中提取关键词"""
         import re
@@ -153,28 +173,17 @@ class PersonalitySystem:
             "这个", "那个", "今天", "明天", "昨天", "差不多", "还行",
             "是的", "不是", "好的", "对的", "嗯", "哦", "啊", "呢",
             "呢", "呀", "哦", "嗯", "哈", "哈哈", "嘿嘿", "呵呵",
-            "有", "没有", "要", "不要", "可以", "不可以", "好", "不好"
+            "有", "没有", "要", "不要", "可以", "不可以", "好", "不好",
+            "现在", "时候", "一下", "一点", "东西", "时候", "这么",
+            "那么", "真的", "觉得", "知道", "应该", "需要", "能够",
+            "能够", "其实", "因为", "所以", "但是", "然后", "这样",
+            "那样", "只是", "只是", "已经", "仍然", "还是", "或者",
+            "还是", "以及", "对于", "关于", "通过", "进行", "使用",
+            "使用", "提供", "表示", "说明", "意义", "内容", "问题",
+            "问题", "事情", "方面", "情况", "方式", "方法", "可能",
+            "可能", "比较", "比较", "非常", "特别", "十分", "相当",
         }
         return [k for k in keywords if k not in common_words and len(k) >= 2]
-    
-    # ========== 主动互动 ==========
-    
-    def update_chat_time(self):
-        """更新最后对话时间"""
-        self._last_chat_time = time.time()
-    
-    def should_initiate_chat(self, idle_timeout: int = 300) -> bool:
-        """判断是否应该主动发起对话"""
-        now = time.time()
-        idle_time = now - self._last_chat_time
-        if idle_time >= idle_timeout:
-            # 30% 概率主动搭话
-            return random.random() < 0.3
-        return False
-    
-    def get_initiation_line(self) -> str:
-        """获取主动搭话的句子"""
-        return random.choice(self._active_lines)
     
     # ========== 综合提示 ==========
     

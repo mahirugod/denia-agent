@@ -7,8 +7,10 @@
 import os
 import sys
 import json
+import base64
 import signal
 import time
+import collections
 
 # Windows 控制台强制 UTF-8
 try:
@@ -29,9 +31,8 @@ if BOT_DIR not in sys.path:
 
 from PySide6.QtCore import Qt, QTimer, QObject, Signal
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 
-from terminal_window import TerminalWindow
 from chat_controller import ChatController
 from pet_widget import FloatingPet
 from console_window import ConsoleWindow
@@ -63,11 +64,13 @@ class TerminalApp(QObject):
         self.app.setApplicationName("达妮娅终端")
 
         # 组件
-        self.window = TerminalWindow()
         self.pet = FloatingPet()
         self.controller = ChatController()
         self.process_mgr = ProcessManager()
         self.console_window = None  # Web 控制台（懒加载）
+        self.tray = None            # 托盘图标（_setup_tray 创建）
+        # 日志环形缓冲：控制台后打开也能看到之前的服务日志
+        self._log_buffer = collections.deque(maxlen=500)
 
         self._wire_signals()
         self._setup_tray()
@@ -98,14 +101,8 @@ class TerminalApp(QObject):
         """根据当前模型类型开关 Ollama 巡检：仅本地 Ollama 模型才巡检本地推理后端"""
         if self.active_monitor is None:
             return
-        model_name = self._settings.get("model_name", "qwen2.5:3b")
-        llm_url = self._settings.get("llm_url", "http://127.0.0.1:11434")
-        is_ollama = (
-            not model_name.startswith("cloud:")
-            and not model_name.startswith("agnes")
-            and ("ollama" in llm_url.lower() or "11434" in llm_url)
-        )
-        self.active_monitor.set_ollama_enabled(is_ollama)
+        # 现在只走 agnes 云端一条路：Ollama 已不再作为启停对象，默认关闭 Ollama 巡检
+        self.active_monitor.set_ollama_enabled(False)
 
     def _load_settings(self):
         """从 settings.json 加载设置"""
@@ -118,103 +115,98 @@ class TerminalApp(QObject):
         except Exception as e:
             print(f"[设置] 加载失败，使用默认: {e}")
         self._settings = defaults
-        # 同步到 UI 控件
-        if hasattr(self.window, "napcat_enabled"):
-            self.window.napcat_enabled.setChecked(
-                self._settings.get("napcat_enabled", False)
-            )
-        if hasattr(self.window, "auto_start"):
-            self.window.auto_start.setChecked(self._settings.get("auto_start", True))
-        # 回填 LLM + 云端配置到 UI
-        if hasattr(self.window, "llm_model"):
-            self.window.llm_model.setText(self._settings.get("model_name", "qwen2.5:3b"))
-        if hasattr(self.window, "llm_url"):
-            self.window.llm_url.setText(self._settings.get("llm_url", "http://127.0.0.1:11434/api/chat"))
-        if hasattr(self.window, "cloud_api_key"):
-            self.window.cloud_api_key.setText(self._settings.get("cloud_api_key", ""))
-        if hasattr(self.window, "cloud_base_url"):
-            self.window.cloud_base_url.setText(self._settings.get("cloud_base_url", ""))
-        if hasattr(self.window, "cloud_model"):
-            self.window.cloud_model.setText(self._settings.get("cloud_model", ""))
+        # 只走 agnes 云端一条路：非 agnes 模型强制切回
+        model = self._settings.get("model_name", "")
+        if not model.startswith("agnes"):
+            self._settings["model_name"] = "agnes-3.0-flash"
+            self._on_log("🔒 模型已锁定为云端 agnes-3.0-flash（本地推理入口已下线）")
+            try:
+                self._save_settings()
+            except Exception:
+                pass
+        # 设置只保存在 self._settings，不再回填原生窗口控件（Web 控制台为唯一 UI）
 
-    def _save_settings(self):
-        """保存设置到 settings.json"""
+    def _save_settings(self, updates: dict = None):
+        """保存设置到 settings.json
+
+        传入 updates 时只覆盖这些键，其余键（weather_city / bilibili_* /
+        proactive_* 等）原样保留；不传则原样重写当前配置。
+        """
+        if updates:
+            self._settings.update(updates)
+        # 先写临时文件再原子替换：写一半崩溃/断电也不会留下半个 settings.json
+        tmp = SETTINGS_FILE + ".tmp"
         try:
-            data = {
-                "napcat_enabled": self.window.napcat_enabled.isChecked(),
-                "auto_start": self.window.auto_start.isChecked(),
-                "model_name": getattr(self.window, "llm_model", None) and self.window.llm_model.text() or self._settings.get("model_name", "qwen2.5:3b"),
-                "llm_url": getattr(self.window, "llm_url", None) and self.window.llm_url.text() or "http://127.0.0.1:11434/api/chat",
-                "cloud_api_key": getattr(self.window, "cloud_api_key", None) and self.window.cloud_api_key.text() or "",
-                "cloud_base_url": getattr(self.window, "cloud_base_url", None) and self.window.cloud_base_url.text() or "",
-                "cloud_model": getattr(self.window, "cloud_model", None) and self.window.cloud_model.text() or "",
-            }
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._settings, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, SETTINGS_FILE)
             self._on_log("💾 设置已保存")
         except Exception as e:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
             self._on_log(f"❌ 保存设置失败: {e}")
 
     def napcat_enabled(self) -> bool:
-        """NapCat 是否启用（优先 UI 控件，后 settings.json，默认关闭）"""
-        if hasattr(self.window, "napcat_enabled"):
-            return self.window.napcat_enabled.isChecked()
-        return self._settings.get("napcat_enabled", False)
+        """NapCat 是否启用（读 settings.json，默认关闭）"""
+        return bool(self._settings.get("napcat_enabled", False))
 
     def _wire_signals(self):
-        w = self.window
         c = self.controller
         pm = self.process_mgr
 
-        # 窗口 → 控制器
-        w.chat_message_sent.connect(c.send_message)
-        w.voice_input_started.connect(c.start_mic)
-        w.voice_input_stopped.connect(c.stop_mic)
-        w.voice_input_cancelled.connect(c.cancel_mic)
-        w.service_start_requested.connect(self._on_start_all)
-        w.service_stop_requested.connect(self._on_stop_all)
-        w.service_start_single.connect(self._on_start_single)
-        w.service_stop_single.connect(self._on_stop_single)
-        w.minimize_to_pet.connect(self._show_pet)
-        w.open_console_requested.connect(self.show_console)
-        w.settings_save_requested.connect(self._save_settings)
-
-        # 控制器 → 窗口
-        c.stream_begin.connect(w.stream_begin)
-        c.stream_delta.connect(w.stream_append)
-        c.stream_finish.connect(w.stream_finish)
+        # 控制器 → 应用级（Web 控制台的桥接在 _get_or_create_console 里接）
         c.state_changed.connect(self._on_state_changed)
         c.log.connect(self._on_log)
-        c.reminder_fired.connect(w.flash_message)
-        c.user_message.connect(w._append_user_message)
-        # 识别结果由控制器自动发送，不再回填旧输入框；此信号保留用于兼容与日志
 
         # 悬浮小人
         self.pet.restore_requested.connect(self._restore_window)
 
         # 进程管理器
         pm.log_received.connect(self._on_log)
-        pm.status_changed.connect(self._on_service_status)
-
-        # 提醒卡片定期刷新（30s 一次，倒计时准点变"即将到点"）
-        self._reminder_timer = QTimer()
-        self._reminder_timer.setInterval(30000)
-        self._reminder_timer.timeout.connect(self._refresh_reminder_card)
-        self._reminder_timer.start()
-        self._refresh_reminder_card()
-
-    def _refresh_reminder_card(self):
-        """把待触发提醒推给主窗口卡片"""
-        try:
-            reminders = self.controller.get_active_reminders()
-            self.window.update_reminder_card(reminders)
-        except Exception:
-            pass
 
     def _setup_tray(self):
+        """托盘图标与菜单（应用级，不依赖任何窗口）"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            print("[托盘] 系统托盘不可用（图标会落到通知区域折叠区），改用悬浮小人入口")
+            return
         tray_path = os.path.join(ASSETS_DIR, "tray_dania.png")
-        if os.path.exists(tray_path):
-            self.app.setWindowIcon(QIcon(tray_path))
+        if not os.path.exists(tray_path):
+            print(f"[托盘] 图标文件缺失: {tray_path}")
+            return
+        self.app.setWindowIcon(QIcon(tray_path))
+        self.tray = QSystemTrayIcon(QIcon(tray_path), self.app)
+        self.tray.setToolTip("达妮娅终端")
+        menu = QMenu()
+        menu.addAction("🖥️ 打开控制台", self.show_console)
+        menu.addAction("🐾 悬浮小人", self._show_pet)
+        menu.addSeparator()
+        menu.addAction("❌ 退出", self._quit)
+        self.tray.setContextMenu(menu)
+        self.tray_menu = menu  # 必须持有引用，否则菜单会被回收
+        self.tray.activated.connect(
+            lambda reason: self.show_console()
+            if reason == QSystemTrayIcon.Trigger else None
+        )
+        self.tray.show()
+        print(f"[托盘] 已创建 (visible={self.tray.isVisible()})，"
+              f"图标可能被 Windows 收进任务栏通知区域，点击 ^ 可展开")
+
+    def _quit(self):
+        """托盘退出：停服务、卸键盘监听后退出"""
+        try:
+            self.controller.uninstall_system_space_listener()
+        except Exception:
+            pass
+        try:
+            self.process_mgr.stop_all()
+        except Exception:
+            pass
+        self.app.quit()
 
     # ---------- Web 控制台 ----------
     def _get_or_create_console(self):
@@ -225,18 +217,61 @@ class TerminalApp(QObject):
             c = self.controller
             c.stream_begin.connect(b.chat_started.emit)
             c.stream_delta.connect(b.chat_delta.emit)
-            c.reply_ready.connect(b.chat_finished.emit)
+            c.stream_stall.connect(b.chat_stall.emit)
+            c.stream_clear.connect(b.chat_clear.emit)
+            c.voice_partial.connect(b.chat_partial.emit)
+            c.stream_finish.connect(b.chat_finished.emit)
+            c.stream_thinking.connect(b.chat_thinking.emit)
             c.tool_event.connect(b.tool_event.emit)
-            c.log.connect(b.log.emit)
+            # c.log 已经连到 _on_log，由 _on_log 统一转发到 b.log，避免重复
             c.reminder_fired.connect(b.reminder_fired.emit)
             c.state_changed.connect(b.emotion_changed.emit)
-            c.voice_playing.connect(b.voice_playback.emit)
             c.user_message.connect(b.user_message.emit)
             self.weather.weather_ready.connect(
                 lambda d: b.weather_updated.emit(json.dumps(d, ensure_ascii=False)))
             self.system_status.system_ready.connect(
                 lambda d: b.system_updated.emit(json.dumps(d, ensure_ascii=False)))
+            # 桌面端发图出口：page_image / image_search 等工具在没有 QQ 会话时推到控制台
+            try:
+                from qq_outbox import set_local_sink
+
+                set_local_sink(self._push_console_images)
+            except Exception as e:
+                print(f"[发图] 注册控制台出口失败: {e}")
         return self.console_window
+
+    def _push_console_images(self, items):
+        """把工具抓到的图片转成 data URL 推给控制台，显示为图片气泡"""
+        win = self.console_window
+        if win is None:
+            return
+        imgs = []
+        for item in items or []:
+            src = str(item or "").strip()
+            if not src:
+                continue
+            if src.lower().startswith(("http://", "https://")):
+                imgs.append({"src": src, "name": ""})
+                continue
+            try:
+                if not os.path.isfile(src) or os.path.getsize(src) > 8 * 1024 * 1024:
+                    continue
+                ext = os.path.splitext(src)[1].lower().lstrip(".") or "png"
+                mime = {
+                    "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp",
+                    "gif": "image/gif", "bmp": "image/bmp",
+                }.get(ext, "image/png")
+                with open(src, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                imgs.append({"src": f"data:{mime};base64,{b64}", "name": os.path.basename(src)})
+            except Exception:
+                continue
+        if not imgs:
+            return
+        try:
+            win.bridge.image_message.emit(json.dumps({"images": imgs}, ensure_ascii=False))
+        except Exception as e:
+            print(f"[发图] 推送控制台失败: {e}")
 
     def show_console(self):
         self.weather.refresh()  # 打开控制台时顺带刷新天气（5 分钟节流）
@@ -268,6 +303,20 @@ class TerminalApp(QObject):
     def console_send_message(self, text: str):
         """控制台聊天 → 交给 ChatController（与主窗口共用同一条流式链路）"""
         self.controller.send_message(text)
+
+    # ----- Cloudflare WARP 开关（顶栏胶囊）-----
+    def get_warp_status(self) -> str:
+        """WARP 当前状态（JSON 字符串）"""
+        try:
+            import warp_control
+            return json.dumps(warp_control.status(), ensure_ascii=False)
+        except Exception:
+            return "{}"
+
+    def toggle_warp(self) -> dict:
+        """连接 / 断开 WARP"""
+        import warp_control
+        return warp_control.toggle()
 
     def _on_voice_interrupt(self):
         """控制台打断语音 → 转发给控制器"""
@@ -309,41 +358,65 @@ class TerminalApp(QObject):
                 if state == "running" and bot_state != "running":
                     state = "starting"
             result.append({"name": name, "display": display, "state": state})
+        # WARP 开关行：状态映射 connected→running / connecting→starting / 其它→stopped
+        try:
+            import warp_control
+            w = warp_control.status() or {}
+            ws = w.get("state", "missing")
+            if not w.get("available"):
+                w_state = "failed"
+            elif ws == "connected":
+                w_state = "running"
+            elif ws == "connecting":
+                w_state = "starting"
+            else:
+                w_state = "stopped"
+            result.insert(0, {"name": "warp", "display": "Cloudflare WARP",
+                             "state": w_state, "note": w.get("text", "")})
+        except Exception as e:
+            result.insert(0, {"name": "warp", "display": "Cloudflare WARP",
+                             "state": "failed", "note": str(e)[:60]})
         return result
 
+    def warp_start(self) -> None:
+        """启动页 WARP「启动」按钮：连接 WARP（后台执行，不卡界面）"""
+        import threading
+
+        def work():
+            try:
+                import warp_control
+                data = warp_control.set_enabled(True)
+                self._on_log(f"🌐 WARP: {data.get('text', '')[:80]}")
+            except Exception as e:
+                self._on_log(f"⚠️ WARP 连接失败: {str(e)[:80]}")
+
+        threading.Thread(target=work, name="warp-start", daemon=True).start()
+
+    def warp_stop(self) -> None:
+        """启动页 WARP「停止」按钮：断开 WARP（后台执行，不卡界面）"""
+        import threading
+
+        def work():
+            try:
+                import warp_control
+                data = warp_control.set_enabled(False)
+                self._on_log(f"🌐 WARP: {data.get('text', '')[:80]}")
+            except Exception as e:
+                self._on_log(f"⚠️ WARP 断开失败: {str(e)[:80]}")
+
+        threading.Thread(target=work, name="warp-stop", daemon=True).start()
+
     def get_settings(self) -> list:
-        model_name = self._settings.get("model_name", "qwen2.5:3b")
+        # 只走 agnes 云端一条路：模型只列云端，不再展示本地推理配置项
+        model_name = self._settings.get("model_name", "agnes-3.0-flash")
         options = [
-            {"value": "qwen2.5:3b", "label": "本地 qwen2.5:3b"},
             {"value": "agnes-3.0-flash", "label": "云端 agnes-3.0-flash"},
         ]
-        # 动态填充：扫描本地 models 文件夹，列出可用模型
-        try:
-            from bot.skills.model_detect import detect_local_models
-            local_models = detect_local_models()
-            for m in local_models:
-                if not any(o["value"] == m for o in options):
-                    options.append({"value": m, "label": f"本地 {m}"})
-            # 当前 model_name 不在选项里（如手动改过 settings.json）时补进去
-            if model_name and not any(o["value"] == model_name for o in options):
-                options.append({"value": model_name, "label": f"本地 {model_name}"})
-        except Exception as e:
-            print(f"[模型检测] 填充设置页选项失败: {e}")
-
-        # 按当前模型类型动态展示对应配置项（避免一次性堆太多条目）
-        # ags 与通用云端（cloud:）同属「云端模型」一组；模型名跟随 model_name 下拉，不重复填
-        model_items: list = []
-        if model_name.startswith("cloud:") or model_name.startswith("agnes"):
-            model_items = [
-                {"label": "云端 API Key", "key": "cloud_api_key", "value": self._settings.get("cloud_api_key", ""), "type": "str", "placeholder": "sk-... 或其它 Bearer token"},
-                {"label": "云端 Base URL", "key": "cloud_base_url", "value": self._settings.get("cloud_base_url", ""), "type": "str", "placeholder": "如 https://api.openai.com/v1 或 https://dashscope.aliyuncs.com/compatible-mode/v1"},
-            ]
-        else:
-            model_items = [
-                {"label": "本地推理后端 Base URL", "key": "llm_url", "value": self._settings.get("llm_url", "http://127.0.0.1:11434/api/chat"), "type": "str", "placeholder": "如 http://127.0.0.1:1234/v1（LM Studio/vLLM 等）；Ollama 默认无需配置"},
-                {"label": "本地推理后端 API Key", "key": "llm_api_key", "value": self._settings.get("llm_api_key", "ollama"), "type": "str", "placeholder": "Ollama 默认 ollama，其它后端按需填写"},
-            ]
-        model_items.append({"label": "提示：切换「LLM 模型」后，配置项会随之变化（云端/本地）", "key": "_model_hint", "value": "", "type": "hint"})
+        model_items: list = [
+            {"label": "云端 API Key", "key": "cloud_api_key", "value": self._settings.get("cloud_api_key", ""), "type": "str", "placeholder": "sk-... 或其它 Bearer token"},
+            {"label": "云端 Base URL", "key": "cloud_base_url", "value": self._settings.get("cloud_base_url", ""), "type": "str", "placeholder": "如 https://api.agnes-ai.cn/v1"},
+        ]
+        model_items.append({"label": "提示：模型已锁定为云端 agnes（本地推理入口已下线），改配置后会自动重新初始化", "key": "_model_hint", "value": "", "type": "hint"})
 
         return [
             {"label": "角色形象", "key": "character", "value": "达妮娅", "type": "str"},
@@ -364,6 +437,13 @@ class TerminalApp(QObject):
             },
             *model_items,
             {
+                "label": "B站 登录凭证（官号动态）",
+                "key": "bilibili_login",
+                "type": "action",
+                "button": "扫码登录",
+                "value": self._bili_state_text(),
+            },
+            {
                 "label": "启用 NapCat（QQ 消息转发）",
                 "key": "napcat",
                 "value": self.napcat_enabled(),
@@ -372,36 +452,46 @@ class TerminalApp(QObject):
             {
                 "label": "启动时自动检测并补齐服务",
                 "key": "autostart",
-                "value": self.window.auto_start.isChecked(),
+                "value": bool(self._settings.get("auto_start", True)),
                 "type": "bool",
             },
         ]
 
+    def _bili_state_text(self) -> str:
+        """设置页展示的 B站 凭证状态文案"""
+        if not (self._settings.get("bilibili_sesdata") or "").strip():
+            return "未配置（只能搜B站视频，拿不到官方公告）"
+        ok = getattr(self, "_bili_cookie_ok", None)
+        if ok is False:
+            return "已失效，请重新扫码"
+        if ok is True:
+            return "已配置（有效）"
+        return "已配置"
+
+    def save_bilibili_cookie(self, sesdata: str, bili_jct: str = ""):
+        """保存扫码登录拿到的 B站 凭证（web_search 按 mtime 缓存，无需重启）"""
+        if not sesdata:
+            return
+        updates = {"bilibili_sesdata": sesdata}
+        if bili_jct:
+            updates["bilibili_jct"] = bili_jct
+        self._save_settings(updates)
+        self._bili_cookie_ok = True
+        self._on_log("✅ B站 登录成功，官号动态已启用")
+
     def save_setting(self, key: str, value: str):
         self._on_log(f"⚙️ 设置变更: {key} = {value}")
         if key == "napcat":
-            self.window.napcat_enabled.setChecked(value.lower() == "true")
-            self._save_settings()
+            checked = value.lower() == "true"
+            self._save_settings({"napcat_enabled": checked})
         elif key == "autostart":
-            self.window.auto_start.setChecked(value.lower() == "true")
-            self._save_settings()
+            checked = value.lower() == "true"
+            self._save_settings({"auto_start": checked})
         elif key in ("cloud_api_key", "cloud_base_url", "cloud_model",
                       "llm_url", "llm_api_key"):
             # 模型配置项（通用云端 / 本地推理后端）：直接写 settings.json
             # 其中 llm_url / 云端三项 改完需要重新初始化 LLM 才生效
-            self._settings[key] = value
-            try:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
-            data[key] = value
-            try:
-                with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                self._on_log(f"💾 {key} 已保存")
-            except Exception as e:
-                self._on_log(f"❌ 保存 {key} 失败: {e}")
+            self._save_settings({key: value})
             # 影响 LLM 路由/请求的参数，保存后立即重新初始化
             if key in ("llm_url", "llm_api_key", "cloud_api_key", "cloud_base_url"):
                 import threading
@@ -411,18 +501,7 @@ class TerminalApp(QObject):
                 ).start()
         elif key == "model_name":
             # 切换 LLM 模型：写 settings.json + 后台重新初始化
-            self._settings["model_name"] = value
-            try:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
-            data["model_name"] = value
-            try:
-                with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                self._on_log(f"❌ 保存 model_name 失败: {e}")
+            self._save_settings({"model_name": value})
             label_map = {"qwen2.5:3b": "本地 qwen2.5:3b", "agnes-3.0-flash": "云端 agnes-3.0-flash"}
             label = label_map.get(value)
             if label is None:
@@ -439,15 +518,46 @@ class TerminalApp(QObject):
 
     # ---------- 状态 ----------
     def _on_state_changed(self, state: str):
-        self.window.set_avatar_state(state)
         self.pet.set_state(state)
 
     # ---------- 日志 ----------
     def _on_log(self, text: str):
+        """所有日志统一出口：写盘 / 控制台缓冲 / Web 控制台日志面板"""
         print(text, flush=True)
-        # 更新首页状态卡片
-        if "提醒" in text or "⏰" in text:
-            self.window.update_task_card(text)
+        line = str(text or "")
+        try:
+            self._log_buffer.append(line)
+        except Exception:
+            pass
+        if self.console_window is not None:
+            try:
+                self.console_window.bridge.log.emit(line)
+            except Exception:
+                pass
+
+    def get_recent_logs(self) -> str:
+        """控制台打开时拉取打开前的日志（JSON 数组字符串）"""
+        try:
+            return json.dumps(list(self._log_buffer), ensure_ascii=False)
+        except Exception:
+            return "[]"
+
+    def get_recent_traces(self) -> str:
+        """控制台「最近对话」：读 bot/data/qq_trace.jsonl 末尾 30 轮"""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "bot", "data", "qq_trace.jsonl")
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.readlines()[-30:]
+            rows = []
+            for ln in lines:
+                try:
+                    rows.append(json.loads(ln))
+                except Exception:
+                    continue
+            return json.dumps(rows, ensure_ascii=False)
+        except Exception:
+            return "[]"
 
     # ---------- 主动性告警 ----------
     def _on_active_alert(self, alert: dict):
@@ -504,20 +614,20 @@ class TerminalApp(QObject):
 
         # 1. 托盘通知（后台也有提示）
         try:
-            if self.window.tray_icon and self.window.tray_icon.isVisible():
+            if self.tray and self.tray.isVisible():
                 msg_type = {
                     "warn": QSystemTrayIcon.MessageIcon.Warning,
                     "info": QSystemTrayIcon.MessageIcon.Information,
                     "ok": QSystemTrayIcon.MessageIcon.Information,
                 }.get(severity, QSystemTrayIcon.MessageIcon.Information)
-                self.window.tray_icon.showMessage(title, detail, msg_type, 5000)
+                self.tray.showMessage(title, detail, msg_type, 5000)
         except Exception:
             pass
 
         # 2. 只有 warn 才弹窗（ok 类「已恢复」不打扰用户）
         if severity == "warn":
             try:
-                box = QMessageBox(self.window)
+                box = QMessageBox()
                 box.setIcon(icon)
                 box.setWindowTitle("达妮娅提醒")
                 box.setText(title)
@@ -530,19 +640,10 @@ class TerminalApp(QObject):
     # ---------- 服务 ----------
     def _on_start_all(self):
         self._on_log("🚀 启动所有服务...")
-        # start_all 内部有 time.sleep 和端口等待，放后台线程避免阻塞 UI
-        import threading
-
+        # 启动已改为 QTimer 异步（不再 sleep 等端口），必须在 GUI 线程调用
         skip = [] if self.napcat_enabled() else ["napcat", "bot"]
-        # Ollama 为可选本地推理后端：云端/ags 模型无需启动
-        model_name = self._settings.get("model_name", "qwen2.5:3b")
-        skip_ollama = model_name.startswith("cloud:") or model_name.startswith("agnes")
-        threading.Thread(
-            target=self.process_mgr.start_all,
-            args=(skip,),
-            kwargs={"skip_ollama": skip_ollama},
-            daemon=True,
-        ).start()
+        # Ollama 已下线：只走 agnes 云端一条路，不再启动本地推理后端
+        self.process_mgr.start_all(skip=skip)
 
     def _on_stop_all(self):
         self._on_log("⏹ 停止所有服务...")
@@ -550,68 +651,86 @@ class TerminalApp(QObject):
 
     def _on_start_single(self, service_key: str):
         display_map = {
-            "ollama": "Ollama",
+            "warp": "Cloudflare WARP",
             "napcat": "NapCat + QQ 机器人",
             "gpt_sovits": "GPT-SoVITS",
         }
         name = display_map.get(service_key, service_key)
         self._on_log(f"🚀 启动 {name}...")
-        # start_service 内部有 time.sleep 和端口等待，放后台线程避免阻塞 UI
-        import threading
-
-        def _run():
-            self.process_mgr.start_service(service_key)
-            if service_key == "napcat":
-                import time as _t
-
-                _t.sleep(3)  # 等待 NapCat WebSocket 就绪
-                self.process_mgr.start_service("bot")
-
-        threading.Thread(target=_run, daemon=True).start()
+        # 启动已改为 QTimer 异步，直接在当前（GUI）线程调用
+        if service_key == "warp":
+            self.warp_start()
+            return
+        self.process_mgr.start_service(service_key)
+        if service_key == "napcat":
+            # 等 NapCat WebSocket 就绪后再拉起机器人（不阻塞界面）
+            QTimer.singleShot(
+                3000, lambda: self.process_mgr.start_service("bot"))
 
     def _on_stop_single(self, service_key: str):
         display_map = {
-            "ollama": "Ollama",
+            "warp": "Cloudflare WARP",
             "napcat": "NapCat + QQ 机器人",
             "gpt_sovits": "GPT-SoVITS",
         }
         name = display_map.get(service_key, service_key)
         self._on_log(f"⏹ 停止 {name}...")
+        if service_key == "warp":
+            self.warp_stop()
+            return
         if service_key == "napcat":
             self.process_mgr.stop_service("bot")
         self.process_mgr.stop_service(service_key)
 
-    def _on_service_status(self, service: str, status: str):
-        name_map = {
-            "ollama": "Ollama",
-            "napcat": "NapCat",
-            "gpt_sovits": "GPT-SoVITS",
-            "bot": "达妮娅机器人",
-        }
-        display = name_map.get(service, service)
-        self.window.update_service_status(display, status)
-
     # ---------- 悬浮小人 ----------
-    def _show_pet(self):
-        self.window.hide()
-        if self.console_window is not None:
-            self.console_window.hide()
+    def _place_pet(self):
+        """把小人放到主屏右下角"""
         screen = self.app.primaryScreen().geometry()
         x = screen.width() - self.pet.width() - 60
         y = screen.height() - self.pet.height() - 100
         self.pet.move(x, y)
+
+    def _show_pet(self):
+        """隐藏控制台，收成右下角悬浮小人"""
+        if self.console_window is not None:
+            self.console_window.hide()
+        self._place_pet()
         self.pet.show()
-        self.window.tray_icon.showMessage(
-            "达妮娅终端",
-            "已切换为悬浮小人",
-            QSystemTrayIcon.MessageIcon.Information,
-            1500,
-        )
+        self._pet_active_transition = time.time()
 
     def _restore_window(self):
         """小人双击 → 回到 Web 主界面（控制台）"""
         self.pet.hide()
         self.show_console()
+        self._pet_active_transition = time.time()
+
+    def _start_pet_monitor(self):
+        """
+        控制台"失顶层"自动收小人：
+        每秒巡检一次 —— 当前激活的 Qt 窗口不是控制台，且小人尚未显示，
+        就收小人；重新激活控制台后再恢复。
+        5 秒冷却避免 _show_pet / _restore_window 切换瞬间反向震荡。
+        """
+        if getattr(self, "_pet_monitor_timer", None):
+            return
+        self._pet_monitor_timer = QTimer(self.app)
+        self._pet_monitor_timer.setInterval(1000)
+        self._pet_monitor_timer.timeout.connect(self._check_pet_trigger)
+        self._pet_monitor_timer.start()
+
+    def _check_pet_trigger(self):
+        if self.pet.isVisible():
+            return
+        # 5 秒冷却：切换瞬间不做反向判断
+        last_transition = getattr(self, "_pet_active_transition", 0)
+        if time.time() - last_transition < 5:
+            return
+        active = self.app.activeWindow()
+        console = self.console_window
+        # 控制台当前可见，且用户切走了 → 收小人
+        if console and console.isVisible() and active is not console:
+            self._on_log("🐾 终端不在顶层，自动收小人")
+            self._show_pet()
 
     # ---------- 异常 ----------
     def _global_exception_handler(self, exc_type, exc_value, exc_tb):
@@ -634,10 +753,13 @@ class TerminalApp(QObject):
         # 系统级空格监听：即使 Web 引擎吞键，也能触发录音 / 识别 / 打断
         self.controller.install_system_space_listener()
 
+        # 控制台失顶层自动收小人
+        self._start_pet_monitor()
+
         print("=" * 50)
         print("✨ 达妮娅终端已启动（Web 主界面）")
         print("   左侧导航：首页/对话/记忆/任务/服务/设置")
-        print("   托盘菜单：显示原始终端 / 悬浮小人 / 打开控制台")
+        print("   不在顶层：自动收起为右下角悬浮小人；双击小人回到控制台")
         print("=" * 50)
 
         # 延迟初始化机器人（避免启动卡顿）
@@ -646,7 +768,64 @@ class TerminalApp(QObject):
         # 自动检测服务
         QTimer.singleShot(1500, self._auto_detect_services)
 
+        # 启动后按需自动连 WARP（x.com 直连不通且 WARP 可用时）
+        QTimer.singleShot(6000, self._auto_warp)
+
+        # 启动后校验 B站 登录凭证，失效则提示重新扫码
+        QTimer.singleShot(8000, self._check_bili_cookie)
+
         return self.app.exec()
+
+    def _check_bili_cookie(self):
+        """后台校验 bilibili_sesdata 是否仍然有效（结果供设置页显示）"""
+        import threading
+
+        def work():
+            try:
+                import requests
+                from web_search import get_bilibili_cookie
+
+                cookie = get_bilibili_cookie()
+                if not cookie:
+                    self._bili_cookie_ok = None
+                    return
+                resp = requests.get(
+                    "https://api.bilibili.com/x/web-interface/nav",
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                      "Chrome/124.0.0.0 Safari/537.36",
+                        "Referer": "https://www.bilibili.com/",
+                        "Cookie": cookie,
+                    },
+                    timeout=8,
+                )
+                ok = bool(((resp.json() or {}).get("data") or {}).get("isLogin"))
+                self._bili_cookie_ok = ok
+                if not ok:
+                    self._on_log("⚠️ B站 登录凭证已失效，去设置页点「扫码登录」更新")
+            except Exception as exc:
+                print(f"[B站校验] {exc}")
+
+        threading.Thread(target=work, name="bili-cookie-check", daemon=True).start()
+
+    def _auto_warp(self):
+        """后台线程探测外网并在需要时连 WARP，不阻塞界面"""
+        import threading
+
+        def work():
+            try:
+                import warp_control
+                result = warp_control.maybe_auto_connect()
+                print(f"[WARP] 启动检查结果: {result}")
+                if result == "connected" and self.console_window is not None:
+                    data = warp_control.status()
+                    self.console_window.bridge.warp_updated.emit(
+                        json.dumps(data, ensure_ascii=False))
+            except Exception as e:
+                print(f"[WARP] 自动连接检查失败: {e}")
+
+        threading.Thread(target=work, name="warp-auto", daemon=True).start()
 
     def _lazy_init(self):
         self._on_log("🤖 正在初始化达妮娅...")
@@ -654,6 +833,21 @@ class TerminalApp(QObject):
         import threading
 
         threading.Thread(target=self._do_init_bot, daemon=True).start()
+        # 顺手清理过期缓存（媒体缓存 7 天 / Edge 缓存），低频后台任务
+        threading.Thread(target=self._cleanup_caches, daemon=True).start()
+
+    def _cleanup_caches(self):
+        """启动时清理媒体缓存与 Edge 缓存，避免目录无限增长"""
+        try:
+            from bot.media_downloader import cleanup_media_cache
+            cleanup_media_cache(days=7)
+        except Exception as e:
+            print(f"[缓存清理] 媒体缓存清理失败: {e}")
+        try:
+            from bot import browser_session
+            browser_session.cleanup_profile_cache()
+        except Exception as e:
+            print(f"[缓存清理] 浏览器缓存清理失败: {e}")
 
     def _do_init_bot(self):
         try:
@@ -674,6 +868,12 @@ class TerminalApp(QObject):
                 voice_api_url="http://127.0.0.1:9880",
                 use_voice=True,
             )
+            # 恢复未触发的提醒（pending_reminders.json）
+            try:
+                from bot.skills.reminder import restore_pending_reminders
+                restore_pending_reminders()
+            except Exception as e:
+                self._on_log(f"[提醒] 恢复失败: {e}")
         except Exception as e:
             self._on_log(f"❌ 初始化异常: {e}")
 
@@ -686,7 +886,7 @@ class TerminalApp(QObject):
                 continue
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(0.5)
+                s.settimeout(0.2)
                 port_ok = s.connect_ex(("127.0.0.1", cfg.port)) == 0
                 s.close()
                 if port_ok:
@@ -699,37 +899,18 @@ class TerminalApp(QObject):
                 self.process_mgr._update_state(name, ProcessManager.STATE_STOPPED)
                 stopped.append(name)
 
-        # 自动补齐未运行的服务（Ollama 仅在本地 Ollama 模型时启动，GPT-SoVITS 可选语音）
-        if (
-            getattr(self.window, "auto_start", None)
-            and self.window.auto_start.isChecked()
-        ):
-            import threading
+        # NapCat 已在运行但机器人没起来 → 补拉一次机器人（避免重启后只剩 NapCat 空转）
+        if self.napcat_enabled() and "napcat" not in stopped:
+            if self.process_mgr._states.get("bot") != ProcessManager.STATE_RUNNING:
+                self._on_log("🚀 检测到 NapCat 在运行，补启机器人...")
+                QTimer.singleShot(1000, lambda: self.process_mgr.start_service("bot"))
 
-            # 仅当当前模型是本地 Ollama 模型时才自动启动 Ollama（云端/ags 模型无需本地推理后端）
-            model_name = self._settings.get("model_name", "qwen2.5:3b")
-            is_cloud_model = model_name.startswith("cloud:") or model_name.startswith("agnes")
-            is_ollama = not is_cloud_model and "ollama" in self._settings.get("llm_url", "http://127.0.0.1:11434").lower()
-            if is_ollama and "ollama" in stopped:
-                self._on_log("🚀 自动启动本地推理后端 (Ollama)...")
-                threading.Thread(
-                    target=self.process_mgr.start_service,
-                    args=("ollama",),
-                    daemon=True,
-                ).start()
-            elif not is_cloud_model and "ollama" in stopped:
-                # 本地模型但 base_url 不是 Ollama → 提示用户确认后端服务已启动
-                self._on_log(f"ℹ️ 当前模型 {model_name} 指向非 Ollama 后端（{self._settings.get('llm_url', '默认')}），请确认该服务已运行")
+        # 自动补齐未运行的服务（Ollama 已下线；GPT-SoVITS 可选语音）
+        if self._settings.get("auto_start", True):
             # GPT-SoVITS 提供达妮娅原声，延迟启动避免抢占资源
             if "gpt_sovits" in stopped:
                 QTimer.singleShot(
-                    3000,
-                    lambda: threading.Thread(
-                        target=self.process_mgr.start_service,
-                        args=("gpt_sovits",),
-                        daemon=True,
-                    ).start(),
-                )
+                    3000, lambda: self.process_mgr.start_service("gpt_sovits"))
             # NapCat 默认不自动启动（需手动开启）
 
     def cleanup(self):
@@ -750,11 +931,19 @@ class TerminalApp(QObject):
             mcp_client.close_all()
         except Exception:
             pass
+        # 退出时断开 WARP（控制台连上的隧道别留在后台）
+        try:
+            import sys
+            _bot = os.path.join(TERMINAL_DIR, "bot")
+            if _bot not in sys.path:
+                sys.path.insert(0, _bot)
+            import warp_control
+            warp_control.disconnect_on_exit()
+        except Exception as e:
+            print(f"[WARP] 退出时断开跳过: {e}")
 
 
 def main():
-    # Ollama 模型存储重定向到项目内可写路径（避免默认 D:\ollama_models 权限问题）
-    os.environ.setdefault("OLLAMA_MODELS", os.path.join(TERMINAL_DIR, "models"))
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     app = TerminalApp()
     try:

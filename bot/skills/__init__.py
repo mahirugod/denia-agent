@@ -118,9 +118,10 @@ def load_skills() -> list:
     支持 skill.yaml 门控：disabled / min_harness / depends 检查。
     """
     global _REGISTERED, _SKIPPED
-    # 确保包路径在 sys.path（直接执行时）
-    if _SKILLS_DIR not in sys.path:
-        sys.path.insert(0, _SKILLS_DIR)
+    # 兜底：调用方可能没有把 bot 目录加入 sys.path
+    _BOT_DIR = os.path.dirname(_SKILLS_DIR)
+    if _BOT_DIR not in sys.path:
+        sys.path.insert(0, _BOT_DIR)
 
     disabled_map = _load_disabled()
     current_harness = _get_current_harness()
@@ -161,7 +162,9 @@ def load_skills() -> list:
                 continue
 
         try:
-            mod = importlib.import_module(pkg)
+            # 必须用包限定名导入：直接用 pkg 会被同名的根目录模块
+            # （如 weather.py 顶栏）抢占，导致 @tool 根本不执行。
+            mod = importlib.import_module(f"{__package__}.{pkg}")
             _REGISTERED.append(pkg)
             # 元信息：skill() 已用模块名登记 _META，这里只补全未声明的
             if pkg not in _META:

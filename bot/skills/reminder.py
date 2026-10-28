@@ -4,7 +4,10 @@
 技能包：提醒（reminder）
 定时提醒：X分钟后/小时后，或写明时间（明天下午3点、下周一9点）。
 支持相对/绝对时间双模式，threading.Timer 到点回调通知 UI。
+未触发的提醒持久化到 pending_reminders.json，启动时恢复。
 """
+import json
+import os
 import re
 import threading
 from datetime import datetime, timedelta
@@ -21,6 +24,89 @@ SKILL_DESCRIPTION = "定时提醒（相对/绝对时间）"
 _reminder_callback = None
 # 进行中的提醒列表（任务页展示用）
 _active_reminders = []
+# 持久化文件（未触发提醒，跨重启保留）
+_PENDING_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "pending_reminders.json",
+)
+
+
+def _save_pending(reminders):
+    """把未触发提醒持久化（只存 fire_at 时间戳 + content + desc + source）"""
+    try:
+        os.makedirs(os.path.dirname(_PENDING_FILE), exist_ok=True)
+        data = [
+            {
+                "fire_at": r["fire_at"].isoformat(),
+                "content": r["content"],
+                "desc": r["desc"],
+                "source": r["source"],
+            }
+            for r in reminders
+        ]
+        with open(_PENDING_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[提醒] 持久化失败: {e}")
+
+
+def _load_pending() -> list:
+    """启动时恢复未触发提醒"""
+    if not os.path.exists(_PENDING_FILE):
+        return []
+    try:
+        with open(_PENDING_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        out = []
+        now = datetime.now()
+        for r in raw:
+            try:
+                fire_at = datetime.fromisoformat(r["fire_at"])
+                if fire_at <= now:
+                    # 已过期，直接触发
+                    out.append({
+                        "fire_at": fire_at,
+                        "content": r["content"],
+                        "desc": r["desc"],
+                        "source": r["source"],
+                        "_expired": True,
+                    })
+                else:
+                    out.append({
+                        "fire_at": fire_at,
+                        "content": r["content"],
+                        "desc": r["desc"],
+                        "source": r["source"],
+                    })
+            except Exception:
+                continue
+        return out
+    except Exception as e:
+        print(f"[提醒] 恢复失败: {e}")
+        return []
+
+
+def restore_pending_reminders():
+    """main.py 启动时调用：恢复未触发提醒并重新 schedule"""
+    global _active_reminders
+    pending = _load_pending()
+    if not pending:
+        return
+    print(f"[提醒] 恢复 {len(pending)} 条未触发提醒")
+    for entry in pending:
+        if entry.pop("_expired", False):
+            # 过期的立即触发
+            _active_reminders.append(entry)
+            _schedule_reminder(
+                entry["fire_at"], entry["content"], entry["desc"], entry["source"],
+                allow_past=True,
+            )
+        else:
+            _active_reminders.append(entry)
+            _schedule_reminder(
+                entry["fire_at"], entry["content"], entry["desc"], entry["source"],
+            )
+    _save_pending(_active_reminders)
 
 
 def _set_callback(cb):
@@ -180,30 +266,44 @@ def _parse_abs_time(query: str, now: datetime):
     return target, desc
 
 
-def _schedule_reminder(target: datetime, content: str, desc: str, source: str) -> dict:
-    delay = (target - datetime.now()).total_seconds()
+def _schedule_reminder(target: datetime, content: str, desc: str, source: str, allow_past: bool = False) -> dict:
+    now = datetime.now()
+    delay = (target - now).total_seconds()
     if delay < 1:
+        if not allow_past and delay <= 0:
+            # 已过期且不允许追溯：立即触发
+            entry = {"content": content, "fire_at": target, "desc": desc, "source": source}
+            _active_reminders.append(entry)
+            _fire_reminder(entry)
+            _save_pending(_active_reminders)
+            return entry
         delay = 1
     entry = {"content": content, "fire_at": target, "desc": desc, "source": source}
     _active_reminders.append(entry)
+    _save_pending(_active_reminders)
 
     def _fire():
-        try:
-            _active_reminders.remove(entry)
-        except ValueError:
-            pass
-        if _reminder_callback:
-            try:
-                now = datetime.now()
-                when = f"{now.year}年{now.month}月{now.day}日 {now.hour:02d}:{now.minute:02d}"
-                _reminder_callback(f"{when} · {content}")
-            except Exception as e:
-                print(f"[工具] 提醒回调异常: {e}")
+        _fire_reminder(entry)
 
     timer = threading.Timer(delay, _fire)
     timer.daemon = True
     timer.start()
     return entry
+
+
+def _fire_reminder(entry: dict):
+    try:
+        _active_reminders.remove(entry)
+    except ValueError:
+        pass
+    if _reminder_callback:
+        try:
+            now = datetime.now()
+            when = f"{now.year}年{now.month}月{now.day}日 {now.hour:02d}:{now.minute:02d}"
+            _reminder_callback(f"{when} · {entry['content']}")
+        except Exception as e:
+            print(f"[工具] 提醒回调异常: {e}")
+    _save_pending(_active_reminders)
 
 
 def get_active_reminders() -> list:

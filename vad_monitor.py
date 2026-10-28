@@ -54,7 +54,8 @@ class VadMonitor:
                  max_capture_s: float = 15.0, # 单次捕获上限
                  should_stop=None,            # 前置阶段中止（如本会话语音已自然结束）
                  hard_stop=None,              # 捕获阶段强制中止（如应用退出）
-                 on_state=None):              # 状态回调（"listening" / "capturing"）
+                 on_state=None,               # 状态回调（"listening" / "capturing"）
+                 on_frame=None):              # 捕获阶段的 PCM 帧回调（流式识别用）
         self.prob_threshold = prob_threshold
         self.energy_threshold = energy_threshold
         self.min_speech_ms = min_speech_ms
@@ -63,6 +64,7 @@ class VadMonitor:
         self.should_stop = should_stop or (lambda: False)
         self.hard_stop = hard_stop or (lambda: False)
         self.on_state = on_state or (lambda s: None)
+        self.on_frame = on_frame
 
     def run(self):
         """返回捕获的 PCM bytes；未触发返回 None；麦克风不可用抛异常"""
@@ -110,6 +112,13 @@ class VadMonitor:
                             triggered = True
                             captured.extend(b"".join(ring))
                             self.on_state("capturing")
+                            # 触发前的滚动缓存（含起头）先喂给流式识别，避免吞字
+                            if self.on_frame:
+                                for b in list(ring):
+                                    try:
+                                        self.on_frame(b)
+                                    except Exception:
+                                        pass
                     else:
                         speech_ms = max(0, speech_ms - BLOCK_MS * 2)
                         ring.append(block)
@@ -117,6 +126,11 @@ class VadMonitor:
 
                 # 已触发：持续收集，静音达到阈值即认为说完了
                 captured.extend(block)
+                if self.on_frame:
+                    try:
+                        self.on_frame(block)
+                    except Exception:
+                        pass
                 if is_speech:
                     silence_ms = 0
                 else:

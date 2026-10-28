@@ -5,7 +5,7 @@
 查询实时天气、气温、降雨/雪时段。数据源 wttr.in j1，本地零依赖。
 """
 import json
-import os
+import re
 import urllib.parse
 import urllib.request
 
@@ -19,15 +19,13 @@ SKILLS = ["query_weather"]
 SKILL_DESCRIPTION = "查询天气/气温/降雨时段"
 
 
+# 默认城市读取统一在 text_utils（用户档案「城市」优先，回退 settings.weather_city）
+from text_utils import CITY_LIST, get_default_city as _get_default_city
+
+
 def _load_weather_city() -> str:
-    """从项目根 settings.json 读取 weather_city（与主程序天气卡片保持一致）"""
-    try:
-        # bot/skills/weather.py -> skills -> bot -> 项目根（3 层）
-        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        with open(os.path.join(root, "settings.json"), "r", encoding="utf-8") as f:
-            return (json.load(f).get("weather_city") or "").strip()
-    except Exception:
-        return ""
+    """默认城市（用户档案优先，回退 settings.json）"""
+    return _get_default_city()
 
 
 def _fetch_weather_text(city: str = "") -> str:
@@ -65,7 +63,10 @@ def _fetch_weather_text(city: str = "") -> str:
         except Exception:
             city_name = "当地"
 
-    head = "%s当前%s，气温%s°C" % (city_name, cur_desc, temp)
+    if cur_desc in ("", "未知"):
+        head = "%s当前气温%s°C" % (city_name, temp)
+    else:
+        head = "%s今天%s，当前气温%s°C" % (city_name, cur_desc, temp)
     if humidity:
         head += "，湿度%s%%" % humidity
     if wind:
@@ -101,13 +102,36 @@ def _fetch_weather_text(city: str = "") -> str:
     # 明确告知模型「全天是否晴天」，避免模型自行脑补
     full_day_hint = ""
     if has_rain_all_day:
-        full_day_hint = "（注：今天预计有降雨/雪）"
+        full_day_hint = "（今天有降雨/雪）"
     else:
-        full_day_hint = "（注：今天全天无降雨雪，是晴天）"
+        full_day_hint = "（今天无降雨雪）"
 
-    return "（天气信息：%s%s%s。请用达妮娅的语气自然回答，根据资料判断是否晴天/是否需要带伞）" % (
+    return "（天气信息：%s%s%s。用达妮娅的语气自然回答，不要提及“未知/没拿到数据”）" % (
         head, extra, full_day_hint
     )
+
+
+def _city_from_query(query: str) -> str:
+    """从「北京今天天气怎么样」里抽出城市名；抽不出就返回空（回落到配置城市）。
+
+    此前 query_weather 完全忽略入参，问任何城市都返回 settings.weather_city 的天气。
+    """
+    s = (query or "").strip()
+    # 1) 直接命中已知城市表（最可靠，且与检索词本地化共用同一份城市名单）
+    hit = next((c for c in CITY_LIST if c in s), "")
+    if hit:
+        return hit
+    # 2) 剥离口语词后若剩下 2-4 字中文，视作城市名
+    for w in ("查询", "查一下", "查查", "帮我", "请问", "看看", "今天", "明天", "后天",
+              "现在", "目前", "最近", "天气", "气温", "温度", "怎么样", "咋样", "如何",
+              "怎样", "什么", "啥", "多少度", "几度", "预报", "未来", "三天", "几天",
+              "一周", "七天", "的", "呢", "吗", "啊", "呀", "情况",
+              "？", "?", "，", ",", "。", "！", "!", " ", "\t"):
+        s = s.replace(w, "")
+    s = s.strip()
+    if 2 <= len(s) <= 4 and re.fullmatch(r"[\u4e00-\u9fa5]+", s):
+        return s
+    return ""
 
 
 @tool(
@@ -117,4 +141,4 @@ def _fetch_weather_text(city: str = "") -> str:
               "刮风", "降温", "升温", "台风", "暴雨", "天气预报", "起雾"],
 )
 def query_weather(query: str) -> str:
-    return _fetch_weather_text(_load_weather_city())
+    return _fetch_weather_text(_city_from_query(query) or _load_weather_city())

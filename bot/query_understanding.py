@@ -67,6 +67,9 @@ class QueryUnderstanding:
         match = re.match(r'^(\S+)呢\??$', current_input_stripped)
         if match:
             topic = match.group(1)
+            # 「那个呢 / 这个呢」是纯回指，直接沿用上一轮话题
+            if topic in ("那个", "这个", "它", "他", "她"):
+                return self._extend_from_context(last_user_input, last_bot_reply, "继续同一话题")
             # 检查是否是游戏名称
             if any(game in topic for game in self.game_names):
                 return self._extend_with_topic(last_user_input, topic, history)
@@ -84,6 +87,7 @@ class QueryUnderstanding:
             "是啊", "对", "嗯", "好的", "明白了",
             "讲讲呗", "讲讲", "说说呗", "说说", "讲讲吧", "说说吧",
             "详细说说", "详细讲讲", "具体说说", "具体讲讲",
+            "继续", "继续说", "接着讲", "接着说", "然后呢", "还有呢",
             "怎么回事", "什么意思", "是什么",
             "告诉我", "能说说吗", "能讲讲吗", "给我讲讲", "给我说说",
             # 【新增】媒体发送请求

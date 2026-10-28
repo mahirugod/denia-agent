@@ -6,7 +6,6 @@ __pycache__/
 GPT-SoVITS/*
 !GPT-SoVITS/api_v2.py
 napcat/
-open-interpreter/
 models/
 
 # 用户专属敏感数据（含 API Key / 个人画像 / 聊天记录，不入库）
@@ -16,15 +15,34 @@ dania.char
 
 # 运行时产物 / 缓存 / 用户数据
 bot/media_cache/
-bot/knowledge/
+bot/browser_profile/
 bot/temp_audio.*
 *.silk
 *.log
 *.wav
-tts_log.txt
-_move_quark_result.txt
 
 # 编辑器与系统
 .vscode/
 Thumbs.db
 Desktop.ini
+
+# ===== 私有 / 运行时数据（不入库）=====
+# 浏览器 profile（含 B 站/微博登录 cookie）、用户发图原图、日志
+data/
+media_cache/
+# 书架与读书笔记（个人书籍内容，含版权正文切片）
+books/
+bot/books/
+# 个人事实记忆
+bot/memory/
+# 本地表情库（约 90MB，自行放置到 bot/stickers/）
+bot/stickers/
+# NapCat 旧备份（含 QQ 登录凭据与账号信息）
+napcat_backup_old/
+# Node 运行时（约 94MB，随 NapCat 安装包分发）
+node-runtime/
+# 本地 IDE / 分享包 / 快捷方式
+.trae/
+.trae-html-share-packages/
+.screenshots/
+*.lnk

@@ -138,7 +138,7 @@ class VoiceSynthesizer:
         known_dirs = [
             os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "GPT-SoVITS"),
             r"D:\GPT-SoVITS-v2pro-20250604",
-            r"C:\Users\mahiru\Downloads\GPT-SoVITS-v2pro-20250604",
+            os.path.join(os.path.expanduser("~"), "Downloads", "GPT-SoVITS-v2pro-20250604"),
         ]
         for base in known_dirs:
             for sub in ["runtime", "runtime/Scripts"]:

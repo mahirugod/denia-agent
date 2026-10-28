@@ -178,7 +178,7 @@ class MediaHelper:
             image_paths = self.downloader.get_batch_images(keyword, count=count)
             
             if not image_paths:
-                return False, f"抱歉，没有找到'{keyword}'的图片呢..."
+                return False, f"唔……「{keyword}」的图片一张都没找到呢。"
             
             # 发送图片
             if is_group:
@@ -192,11 +192,12 @@ class MediaHelper:
                     if self.sender.send_image_to_private(user_id, path):
                         success_count += 1
             
-            msg = f"成功发送 {success_count}/{len(image_paths)} 张图片！"
+            msg = f"喏，给你找了 {success_count} 张哦～"
             return success_count > 0, msg
         
         except Exception as e:
-            return False, f"发送图片时出错了：{e}"
+            print(f"[图片] 发送失败: {e}")
+            return False, "唔……图片发不出去呢，等下再试试嘛。"
     
     def download_and_send_videos(self, user_id: int, keyword: str, 
                                   count: int = 1, is_group: bool = False) -> tuple:
@@ -209,7 +210,7 @@ class MediaHelper:
             video_paths = self.downloader.get_batch_videos(keyword, count=count)
             
             if not video_paths:
-                return False, f"抱歉，没有找到'{keyword}'的视频呢..."
+                return False, f"唔……「{keyword}」的视频没找到呢。"
             
             # 发送视频
             if is_group:
@@ -223,10 +224,11 @@ class MediaHelper:
                     if self.sender.send_video_to_private(user_id, path):
                         success_count += 1
             
-            msg = f"成功发送 {success_count}/{len(video_paths)} 个视频！"
+            msg = f"喏，视频给你找到了 {success_count} 个哦～"
             return success_count > 0, msg
         
         except Exception as e:
-            return False, f"发送视频时出错了：{e}"
+            print(f"[视频] 发送失败: {e}")
+            return False, "唔……视频发不出去呢，等下再试试嘛。"
 
 # media_helper.py end

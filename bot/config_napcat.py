@@ -16,10 +16,33 @@ NAPCAT_WS_URL = "ws://127.0.0.1:3000"
 LISTEN_PORT = 5700
 
 # ---- AI 模型配置 ----
+# 与桌面端共用 settings.json 的模型配置，保证 QQ 也走同一条 agent 链路
+# （原生 function calling + 多步工具循环）。settings.json 缺失时回落到本地 Ollama。
+import json as _json
+import os as _os
+
+_SETTINGS_PATH = _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "settings.json"
+)
+try:
+    with open(_SETTINGS_PATH, encoding="utf-8") as _f:
+        _SETTINGS = _json.load(_f)
+except Exception:
+    _SETTINGS = {}
+
 USE_LLM      = True                    # True=使用AI模型，False=使用内置模板回复
-LLM_API_KEY  = "ollama"               # 本地Ollama不需要真实Key
-LLM_MODEL    = "qwen2.5:7b"    # 7B模型，需先 ollama pull qwen2.5:7b
-LLM_BASE_URL = "http://127.0.0.1:11434/api/chat"  # Ollama API地址
+# QQ 端固定走云端 agnes：桌面端切到本地模型时 QQ 不受影响；
+# 若 settings.json 明确选了别的云端模型（cloud:<name>）则沿用该选择。
+_SETTINGS_MODEL = _SETTINGS.get("model_name") or ""
+_HAS_CLOUD = bool(_SETTINGS.get("cloud_api_key") and _SETTINGS.get("cloud_base_url"))
+if _SETTINGS_MODEL.startswith(("agnes", "cloud:")):
+    LLM_MODEL = _SETTINGS_MODEL
+elif _HAS_CLOUD:
+    LLM_MODEL = "agnes-3.0-flash"
+else:
+    LLM_MODEL = _SETTINGS_MODEL or "qwen2.5:7b"
+LLM_API_KEY  = _SETTINGS.get("cloud_api_key") or "ollama"   # 本地Ollama不需要真实Key
+LLM_BASE_URL = _SETTINGS.get("cloud_base_url") or "http://127.0.0.1:11434/api/chat"
 LLM_API_URL = ""                       # 留空则使用默认地址
 # ---- 回复频率控制（防封号）----
 REPLY_PROBABILITY_GROUP = 0.3           # 群聊回复概率 30%（10条消息回3条）

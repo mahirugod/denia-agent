@@ -2,6 +2,7 @@
 
 let bridge = null;      // Python 桥接对象
 let chatText = "";      // 当前流式回复累积文本
+let _stallEl = null;    // "先应答"占位气泡（首字未到时显示）
 
 // 连接状态指示
 function setConnStatus(text, ok) {
@@ -43,8 +44,12 @@ function initBridge() {
                 else console.warn("bridge.chat_started 不存在");
                 if (bridge.chat_delta) bridge.chat_delta.connect(onChatDelta);
                 else console.warn("bridge.chat_delta 不存在");
+                if (bridge.chat_stall) bridge.chat_stall.connect(onChatStall);
+                if (bridge.chat_clear) bridge.chat_clear.connect(onChatClear);
+                if (bridge.chat_partial) bridge.chat_partial.connect(onVoicePartial);
                 if (bridge.chat_finished) bridge.chat_finished.connect(onChatFinished);
                 else console.warn("bridge.chat_finished 不存在");
+                if (bridge.chat_thinking) bridge.chat_thinking.connect(onChatThinking);
                 if (bridge.chat_failed) bridge.chat_failed.connect(onChatFailed);
                 if (bridge.service_updated) bridge.service_updated.connect(onServiceUpdated);
                 if (bridge.tool_event) bridge.tool_event.connect(onToolEvent);
@@ -54,17 +59,20 @@ function initBridge() {
                     bridge.reminder_fired.connect(loadHomeCards);  // 提醒触发后刷新首页任务卡
                 }
                 if (bridge.emotion_changed) bridge.emotion_changed.connect(setHeroEmotion);
-                if (bridge.voice_playback) bridge.voice_playback.connect(onVoicePlayback);
                 if (bridge.user_message) bridge.user_message.connect(onUserMessage);
                 if (bridge.weather_updated) bridge.weather_updated.connect(onWeatherUpdated);
+                if (bridge.warp_updated) bridge.warp_updated.connect(onWarpUpdated);
+                if (bridge.bili_login_finished) bridge.bili_login_finished.connect(onBiliLoginFinished);
+                if (bridge.image_message) bridge.image_message.connect(onImageMessage);
                 if (bridge.system_updated) bridge.system_updated.connect(renderSystemStatus);
                 console.log("[Console] 桥接已就绪");
                 setConnStatus("已连接", true);
                 refreshServices();
                 loadHomeCards();
                 loadWeather();
+                scheduleWarpPoll();
+                setupLogPanel();
                 setupWindowControls();
-                initLive2D();
             });
         } else {
             tries++;
@@ -89,6 +97,7 @@ function setupMockBridge() {
     const wrap = (val) => Promise.resolve(val);
     bridge = {
         send_message: (t) => {
+            onChatStarted();
             // 模拟工具协作流（含"打开"时）
             if (/打开|启动/.test(t)) {
                 setTimeout(() => onToolEvent(JSON.stringify({
@@ -101,7 +110,28 @@ function setupMockBridge() {
                     result: '（系统信息：已为用户启动「网易云音乐」。请用达妮娅的语气确认一下）',
                 })), 1200);
             }
-            setTimeout(() => onChatFinished('（mock）我收到了：' + t), 1800);
+            // 逐字追加到气泡（与真实后端 chat_delta 行为一致）
+            const full = '（mock）我收到了：' + t;
+            let i = 0;
+            const iv = setInterval(() => {
+                if (i >= full.length) {
+                    clearInterval(iv);
+                    onChatFinished('');
+                    return;
+                }
+                onChatDelta(full[i]);
+                i += 1;
+            }, 15);
+        },
+        send_image: (b64, name, text) => {
+            onChatStarted();
+            const full = '（mock）我看到你发的图了' + (text ? '：' + text : '。');
+            let i = 0;
+            const iv = setInterval(() => {
+                if (i >= full.length) { clearInterval(iv); onChatFinished(''); return; }
+                onChatDelta(full[i]);
+                i += 1;
+            }, 15);
         },
         replay_voice: () => { console.log("[mock] replay voice"); },
         copy_text: (t) => { try { navigator.clipboard.writeText(t); } catch (e) { } },
@@ -111,7 +141,7 @@ function setupMockBridge() {
             { text: "接入语音合成流式播放", done: false, prio: "中" },
         ])),
         get_services: () => wrap(JSON.stringify([
-            { name: "ollama", display: "Ollama 推理引擎", state: "running" },
+            { name: "warp", display: "Cloudflare WARP", state: "stopped" },
             { name: "gpt_sovits", display: "GPT-SoVITS 语音合成", state: "running" },
             { name: "napcat", display: "NapCat 消息桥接", state: "stopped" },
         ])),
@@ -123,6 +153,10 @@ function setupMockBridge() {
         ])),
         get_weather: () => wrap("{}"),
         get_system_status: () => wrap("{}"),
+        get_warp_status: () => wrap("{}"),
+        get_recent_logs: () => wrap("[]"),
+        get_recent_traces: () => wrap("[]"),
+        toggle_warp: () => { },
         start_service: () => { },
         stop_service: () => { },
         save_setting: () => { },
@@ -135,12 +169,11 @@ function setupMockBridge() {
         log: { connect: () => { } },
         reminder_fired: { connect: () => { } },
         emotion_changed: { connect: () => { } },
-        voice_playback: { connect: () => { } },
         weather_updated: { connect: () => { } },
+        warp_updated: { connect: () => { } },
         system_updated: { connect: () => { } },
         user_message: { connect: () => { } },
     };
-    initLive2D();
 }
 
 // 页面就绪后初始化桥接
@@ -156,6 +189,7 @@ function setupWindowControls() {
     const minBtn = document.getElementById('win-min');
     const maxBtn = document.getElementById('win-max');
     const closeBtn = document.getElementById('win-close');
+    const petBtn = document.getElementById('pet-btn');
     if (!topbar || !minBtn || !maxBtn || !closeBtn) return;
 
     const call = (name) => { if (bridge && bridge[name]) try { bridge[name](); } catch (e) { } };
@@ -163,6 +197,7 @@ function setupWindowControls() {
     minBtn.addEventListener('click', () => call('minimize_window'));
     maxBtn.addEventListener('click', () => call('toggle_max_window'));
     closeBtn.addEventListener('click', () => call('close_window'));
+    if (petBtn) petBtn.addEventListener('click', () => call('show_pet'));
 
     // 最大化/还原图标同步
     const iconMax = maxBtn.querySelector('.icon-max');
@@ -170,7 +205,7 @@ function setupWindowControls() {
     function updateMaxIcon(maxed) {
         if (iconMax) iconMax.style.display = maxed ? 'none' : '';
         if (iconRestore) iconRestore.style.display = maxed ? '' : 'none';
-        maxBtn.title = maxed ? '还原' : '最大化';
+        maxBtn.dataset.tip = maxed ? '还原' : '最大化';
     }
     if (bridge && bridge.win_state_changed) bridge.win_state_changed.connect(updateMaxIcon);
     // 初始同步：窗口默认最大化时显示还原图标
@@ -326,8 +361,8 @@ function appendMsg(text, who) {
             '<div class="msg-body">' +
             '<div class="msg-bubble" id="bot-msg-latest"></div>' +
             '<div class="msg-actions">' +
-            '<button class="msg-act act-voice" title="播放语音">' + VOICE_ICON + '</button>' +
-            '<button class="msg-act act-copy" title="复制">' + COPY_ICON + '</button>' +
+            '<button class="msg-act act-voice" data-tip="播放语音">' + VOICE_ICON + '</button>' +
+            '<button class="msg-act act-copy" data-tip="复制">' + COPY_ICON + '</button>' +
             '</div></div>';
         box.appendChild(msg);
         bindBotActions(msg);
@@ -358,34 +393,132 @@ function showReminder(text) {
     box.scrollTop = box.scrollHeight;
 }
 
+// 打字机队列：LLM 快吐 token 时不闪，固定 500ms/字匀速出现
+let _typeQueue = "";
+let _typeTimer = null;
+let _streamEnded = false;
+
 function onChatStarted() {
     chatText = "";
-    appendMsg("", "bot");
+    _typeQueue = "";
+    _streamEnded = false;
+    _stallEl = null;
+    if (_typeTimer) { clearTimeout(_typeTimer); _typeTimer = null; }
+    const existing = document.getElementById('bot-msg-latest');
+    if (existing) {
+        // 重试场景：复用已有气泡并清零，避免新建第二个气泡
+        existing.textContent = "";
+    } else {
+        appendMsg("", "bot");
+    }
 }
 
-function onChatDelta(delta) {
-    chatText += delta;
+function _typePump() {
     const el = document.getElementById('bot-msg-latest');
-    if (el) {
+    if (!el) { _typeQueue = ""; _typeTimer = null; return; }
+    if (_typeQueue.length > 0) {
+        chatText += _typeQueue[0];
+        _typeQueue = _typeQueue.slice(1);
         el.textContent = chatText;
         const box = document.getElementById('chat-messages');
         box.scrollTop = box.scrollHeight;
+        // 积压多时自动加速：每 20 字把间隔缩短一半，最低 50ms
+        const backlog = _typeQueue.length;
+        const interval = backlog > 60 ? 50 : backlog > 30 ? 100 : 200;
+        _typeTimer = setTimeout(_typePump, interval);
+    } else {
+        // 队列消化完
+        if (_streamEnded) {
+            el.removeAttribute('id');
+            const box = document.getElementById('chat-messages');
+            if (box) box.scrollTop = box.scrollHeight;
+        }
+        _typeTimer = null;
     }
 }
 
-function onChatFinished(fullText) {
+// 首字迟迟未到：先在气泡里占位回应，真实内容到达后清掉
+function onChatStall(text) {
+    if (chatText || _typeQueue.length > 0) return;
     const el = document.getElementById('bot-msg-latest');
-    if (el) {
-        el.textContent = fullText || chatText;
-        el.removeAttribute('id');
-    }
-    chatText = "";
+    if (!el) return;
+    el.textContent = text;
+    _stallEl = el;
     const box = document.getElementById('chat-messages');
+    if (box) box.scrollTop = box.scrollHeight;
+}
+
+function onChatClear() {
+    if (!_stallEl) return;
+    if (chatText || _typeQueue.length > 0) { _stallEl = null; return; }
+    _stallEl.textContent = "";
+    _stallEl = null;
+}
+
+function onChatDelta(delta) {
+    // 真实内容到了：先清掉占位文字
+    if (_stallEl) {
+        _stallEl.textContent = "";
+        _stallEl = null;
+    }
+    _typeQueue += delta;
+    if (!_typeTimer) _typePump();
+}
+
+// 思考链：在机器人气泡上方插一个可折叠的「达妮娅想了想」块
+function onChatThinking(thinking) {
+    if (!thinking) return;
+    const box = document.getElementById('chat-messages');
+    if (!box) return;
+    const el = document.getElementById('bot-msg-latest')
+        || box.querySelector('.msg-bot:last-child .msg-bubble');
+    if (!el) return;
+    // 避免重复插入（重试场景）
+    const msgWrap = el.closest('.msg-bot') || el.parentElement;
+    if (msgWrap.querySelector('.thinking-block')) return;
+    const detail = document.createElement('details');
+    detail.className = 'thinking-block';
+    detail.innerHTML =
+        '<summary>🤔 达妮娅想了想</summary>' +
+        '<div class="thinking-content"></div>';
+    detail.querySelector('.thinking-content').textContent = thinking;
+    el.before(detail);
     box.scrollTop = box.scrollHeight;
-    collabFinish();
+}
+
+function onChatFinished(errText) {
+    // 整轮都没等到真实内容：把占位语定格成一条正常消息
+    if (_stallEl && !chatText && _typeQueue.length === 0) {
+        _stallEl.removeAttribute('id');
+        _stallEl = null;
+    }
+    // 不在这里清 timer / 倒出剩余队列——让 _typePump 继续逐字消化，
+    // 保证打字机效果不因流结束而跳变。
+    // errText 非空且从未收到任何 delta → 显示错误。
+    if (_typeQueue.length === 0 && !chatText && errText) {
+        // 完全没收到内容，直接显示错误
+        const el = document.getElementById('bot-msg-latest');
+        if (el) {
+            el.textContent = errText;
+            el.removeAttribute('id');
+        }
+        chatText = "";
+        const box = document.getElementById('chat-messages');
+        if (box) box.scrollTop = box.scrollHeight;
+        return;
+    }
+    // 有内容（或队列还有剩余）：标记"定型"，pump 消化完后不再滚动
+    _streamEnded = true;
+    // 如果 pump 还没启动（极端情况：最后几个字符刚好在 pump 间隔内到达）
+    if (!_typeTimer && _typeQueue.length > 0) {
+        _typePump();
+    }
 }
 
 function onChatFailed(err) {
+    if (_typeTimer) { clearTimeout(_typeTimer); _typeTimer = null; }
+    _typeQueue = "";
+    _stallEl = null;
     const el = document.getElementById('bot-msg-latest');
     if (el) {
         el.textContent = "出错了… " + err;
@@ -394,9 +527,119 @@ function onChatFailed(err) {
     collabError();
 }
 
+// ===== 运行日志面板（启动页）=====
+const _MAX_LOG_LINES = 500;
+
+function _logLevelOf(t) {
+    if (/❌|Traceback|失败|异常|超时|\berror\b/i.test(t)) return 'lv-err';
+    if (/⚠️|警告|\bwarn\b/i.test(t)) return 'lv-warn';
+    if (/✅|就绪|成功|已启动|已连接/i.test(t)) return 'lv-ok';
+    return '';
+}
+
+function appendLogLine(text) {
+    const box = document.getElementById('log-box');
+    if (!box) return;
+    const empty = box.querySelector('.log-empty');
+    if (empty) empty.remove();
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    const div = document.createElement('div');
+    div.className = 'log-line ' + _logLevelOf(text);
+    div.textContent = text;
+    box.appendChild(div);
+    while (box.children.length > _MAX_LOG_LINES) box.removeChild(box.firstChild);
+    if (atBottom) box.scrollTop = box.scrollHeight;
+    const c = document.getElementById('log-count');
+    if (c) c.textContent = box.children.length;
+}
+
 function onLog(text) {
-    // 可在控制台输出，或显示到日志区
-    console.log("[后端]", text);
+    appendLogLine(text);
+}
+
+function loadRecentLogs() {
+    if (!bridge || !bridge.get_recent_logs) return;
+    Promise.resolve(bridge.get_recent_logs()).then(raw => {
+        let list = [];
+        try { list = JSON.parse(raw || "[]"); } catch (e) { return; }
+        const box = document.getElementById('log-box');
+        if (!box) return;
+        box.innerHTML = '';
+        list.slice(-_MAX_LOG_LINES).forEach(appendLogLine);
+        const c = document.getElementById('log-count');
+        if (c) c.textContent = box.children.length;
+        box.scrollTop = box.scrollHeight;
+    }).catch(() => {});
+}
+
+function setupLogPanel() {
+    const btn = document.getElementById('log-clear');
+    if (btn) btn.addEventListener('click', () => {
+        const box = document.getElementById('log-box');
+        if (!box) return;
+        box.innerHTML = '<div class="log-empty">暂无日志</div>';
+        const c = document.getElementById('log-count');
+        if (c) c.textContent = '0';
+    });
+    loadRecentLogs();
+    setupTracePanel();
+}
+
+// ===== 最近对话（启动页复盘：输入 / 直连工具 / 回复）=====
+function _escHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function loadTraces() {
+    if (!bridge || !bridge.get_recent_traces) return;
+    Promise.resolve(bridge.get_recent_traces()).then(raw => {
+        let rows = [];
+        try { rows = JSON.parse(raw || "[]"); } catch (e) { return; }
+        const box = document.getElementById('trace-box');
+        if (!box) return;
+        if (!rows.length) {
+            box.innerHTML = '<div class="log-empty">暂无对话记录</div>';
+        } else {
+            box.innerHTML = rows.map(r => {
+                const tool = r.tool
+                    ? `<span class="trace-tool">⚙ ${_escHtml(r.tool)}</span>`
+                    : '<span class="trace-tool trace-none">模型决策</span>';
+                return `<div class="trace-line">` +
+                    `<span class="trace-time">${_escHtml(r.ts)}</span>` +
+                    `<span class="trace-chat">${_escHtml(r.chat)}</span>` +
+                    `<span class="trace-text">${_escHtml(r.text)}</span>${tool}` +
+                    `<span class="trace-reply">→ ${_escHtml(r.reply)}</span></div>`;
+            }).join('');
+        }
+        const c = document.getElementById('trace-count');
+        if (c) c.textContent = rows.length;
+        box.scrollTop = box.scrollHeight;
+    }).catch(() => {});
+}
+
+function setupTracePanel() {
+    const btn = document.getElementById('trace-refresh');
+    if (btn) btn.addEventListener('click', loadTraces);
+    loadTraces();
+}
+
+// 流式语音识别：边说边把文字写进输入框；结束（空串）时还原用户原本的草稿
+let _voicePartialDraft = null;
+function onVoicePartial(text) {
+    const inputEl = document.getElementById('chat-input');
+    if (!inputEl) return;
+    if (text) {
+        if (_voicePartialDraft === null) _voicePartialDraft = inputEl.value;
+        inputEl.value = text;
+        inputEl.classList.add('voice-live');
+    } else {
+        inputEl.classList.remove('voice-live');
+        if (_voicePartialDraft !== null) {
+            inputEl.value = _voicePartialDraft;
+            _voicePartialDraft = null;
+        }
+    }
 }
 
 function sendMessage(inputEl) {
@@ -414,6 +657,80 @@ function sendMessage(inputEl) {
     btn1.addEventListener('click', () => sendMessage(input1));
     input1.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(input1); });
 
+// ===== 发图入口（＋选择文件 / Ctrl+V 粘贴）=====
+// 前端先压到 ≤1400px 的 JPEG，base64 交给后端视觉模型：原图直传，不做文字描述中转
+function compressImage(file, maxSide = 1400, quality = 0.85) {
+    return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+            URL.revokeObjectURL(url);
+            const scale = Math.min(1, maxSide / Math.max(img.width || 1, img.height || 1));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(img.width * scale));
+            canvas.height = Math.max(1, Math.round(img.height * scale));
+            canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+            resolve(canvas.toDataURL('image/jpeg', quality));
+        };
+        img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('无法读取图片')); };
+        img.src = url;
+    });
+}
+
+// 用户气泡：图片缩略图 + 随图输入的文字
+function appendImageMsg(dataUrl, text) {
+    const box = document.getElementById('chat-messages');
+    if (!box) return;
+    const msg = document.createElement('div');
+    msg.className = 'msg msg-user';
+    msg.innerHTML =
+        '<div class="msg-bubble msg-bubble-img">' +
+        '<img class="msg-img" alt="图片" />' +
+        '<div class="msg-img-caption"></div></div>';
+    msg.querySelector('.msg-img').src = dataUrl;
+    if (text) msg.querySelector('.msg-img-caption').textContent = text;
+    box.appendChild(msg);
+    box.scrollTop = box.scrollHeight;
+}
+
+function sendImageFile(file) {
+    if (!file || !bridge || !bridge.send_image) return;
+    const prompt = input1.value.trim();
+    compressImage(file).then(dataUrl => {
+        const b64 = dataUrl.split(',')[1] || '';
+        if (!b64) return;
+        appendImageMsg(dataUrl, prompt);
+        input1.value = '';
+        collabBegin(prompt || '看这张图');
+        bridge.send_image(b64, file.name || 'pasted.jpg', prompt);
+    }).catch(() => onLog('[图片] 这张图读不出来，换一张试试'));
+}
+
+const attachBtn = document.getElementById('attach-btn');
+const imageFileInput = document.getElementById('image-file');
+if (attachBtn && imageFileInput) {
+    attachBtn.addEventListener('click', () => imageFileInput.click());
+    imageFileInput.addEventListener('change', () => {
+        const f = imageFileInput.files && imageFileInput.files[0];
+        imageFileInput.value = '';
+        if (f) sendImageFile(f);
+    });
+}
+
+// 粘贴剪贴板图片（只在首页对话页生效，避免在设置页误触）
+document.addEventListener('paste', (e) => {
+    const homePage = document.getElementById('page-home');
+    if (!homePage || !homePage.classList.contains('active')) return;
+    const items = (e.clipboardData && e.clipboardData.items) || [];
+    for (const item of items) {
+        if (item.type && item.type.startsWith('image/')) {
+            const f = item.getAsFile();
+            if (f) { e.preventDefault(); sendImageFile(f); }
+            return;
+        }
+    }
+});
+
 // 静态欢迎气泡的按钮绑定
 document.querySelectorAll('#chat-messages .msg-bot').forEach(bindBotActions);
 
@@ -421,16 +738,44 @@ document.querySelectorAll('#chat-messages .msg-bot').forEach(bindBotActions);
 const TOOL_DISPLAY = {
     open_app: '启动本机应用',
     query_time: '查询时间',
+    query_weather: '查询天气',
     set_reminder: '设置提醒',
     screen_context: '屏幕理解',
+    web_search: '正在查资料…',
+    browse_url: '正在看这个页面…',
+    image_search: '正在找图…',
+    bilibili_feed: '正在看B站动态…',
+    system_sense: '正在看系统状态…',
+    model_detect: '正在看本地模型…',
+    list_dir: '正在看文件夹…',
+    read_file: '正在读文件…',
+    write_file: '正在写文件…',
+    organize_folder: '正在整理文件夹…',
+    set_volume: '正在调音量…',
+    set_brightness: '正在调亮度…',
+    read_clipboard: '正在看剪贴板…',
+    write_clipboard: '正在复制…',
+    send_message: '正在发消息…',
 };
 
 let collabThinkingEl = null;
-let collabToolCard = null;
+let collabOpenCards = [];   // 多步执行：同时可能有多个"正在执行"的卡片
 let collabHasTool = false;
 
 function toolDisplayName(ev) {
     return TOOL_DISPLAY[ev.name] || ev.description || ev.name;
+}
+
+// 取出并移除某个工具最近一张"正在执行"的卡片（多步执行时每步一张，互不覆盖）
+function takeOpenCard(name) {
+    for (let i = collabOpenCards.length - 1; i >= 0; i--) {
+        if (collabOpenCards[i].name === name) {
+            const el = collabOpenCards[i].el;
+            collabOpenCards.splice(i, 1);
+            return el;
+        }
+    }
+    return null;
 }
 
 // 从工具注入 LLM 的上下文文本中提取人类可读片段
@@ -451,12 +796,12 @@ function setBannerState(state, text) {
 // ===== 情绪驱动立绘 =====
 // 细腻情绪 → 头像图片映射（复用现有 5 张立绘资产）
 const EMOTION_IMG = {
-    happy: 'assets/dania_happy.png', love: 'assets/dania_happy.png', shy: 'assets/dania_happy.png',
-    angry: 'assets/dania_idle.png', sad: 'assets/dania_idle.png',
-    surprised: 'assets/dania_thinking.png', thinking: 'assets/dania_thinking.png',
-    sleepy: 'assets/dania_sleeping.png', tired: 'assets/dania_sleeping.png', sleeping: 'assets/dania_sleeping.png',
-    speaking: 'assets/dania_speaking.png',
-    idle: 'assets/dania_idle.png',
+    happy: '../assets/dania_happy.png', love: '../assets/dania_happy.png', shy: '../assets/dania_happy.png',
+    angry: '../assets/dania_idle.png', sad: '../assets/dania_idle.png',
+    surprised: '../assets/dania_thinking.png', thinking: '../assets/dania_thinking.png',
+    sleepy: '../assets/dania_sleeping.png', tired: '../assets/dania_sleeping.png', sleeping: '../assets/dania_sleeping.png',
+    speaking: '../assets/dania_speaking.png',
+    idle: '../assets/dania_idle.png',
 };
 // 细腻情绪 → CSS 动画类（同类情绪共用动画）
 const EMOTION_ANIM = {
@@ -481,104 +826,6 @@ function setHeroEmotion(state) {
         const anim = EMOTION_ANIM[state];
         if (anim) wrapEl.classList.add(anim);
     }
-    applyL2DEmotion(state);
-}
-
-// ===== Live2D 立绘（pixi-live2d-display；库/模型缺失时自动回退静态头像） =====
-let _l2dModel = null;
-let _l2dReady = false;
-let _l2dSpeaking = false;
-
-function loadScript(src) {
-    return new Promise((resolve, reject) => {
-        const s = document.createElement('script');
-        s.src = src;
-        s.onload = () => resolve();
-        s.onerror = () => reject(new Error('加载失败: ' + src));
-        document.head.appendChild(s);
-    });
-}
-
-async function initLive2D() {
-    if (_l2dReady) return;
-    try {
-        await loadScript('lib/live2dcubismcore.min.js');
-        await loadScript('lib/pixi.min.js');
-        await loadScript('lib/pixi-live2d-display.min.js');
-        if (!window.PIXI || !PIXI.live2d) return;
-        const canvas = document.getElementById('l2d-canvas');
-        if (!canvas) return;
-        const app = new PIXI.Application({
-            view: canvas,
-            width: 200,
-            height: 200,
-            backgroundAlpha: 0,
-            autoDensity: true,
-            resolution: Math.min(window.devicePixelRatio || 1, 2),
-        });
-        const model = await PIXI.live2d.Live2DModel.from('model/hiyori/Hiyori.model3.json');
-        const ow = model.internalModel.originalWidth || model.width;
-        const oh = model.internalModel.originalHeight || model.height;
-        const scale = Math.min(200 / ow, 200 / oh) * 1.25;
-        model.scale.set(scale);
-        model.anchor.set(0.5, 0.5);
-        model.position.set(100, 108);
-        app.stage.addChild(model);
-        _l2dModel = model;
-        _hookL2dMouth(model);
-        _l2dReady = true;
-        // 就绪：隐藏静态头像，放大容器
-        const wrap = document.getElementById('avatar-wrap');
-        if (wrap) wrap.classList.add('l2d-active');
-        const img = document.getElementById('hero-avatar');
-        if (img) img.style.visibility = 'hidden';
-        console.log('[Live2D] 模型加载成功');
-    } catch (e) {
-        console.warn('[Live2D] 初始化失败，继续使用静态头像:', e && e.message);
-    }
-}
-
-// 口型驱动：包一层 motionManager.update，动作更新后写入嘴型参数
-function _hookL2dMouth(model) {
-    try {
-        const internal = model.internalModel;
-        const core = internal.coreModel;
-        const origin = internal.motionManager.update.bind(internal.motionManager);
-        internal.motionManager.update = function (m, now) {
-            const ok = origin(m, now);
-            if (_l2dSpeaking) {
-                const wave = Math.sin(performance.now() / 85) * 0.5 + 0.5;
-                core.setParameterValueById(
-                    'ParamMouthOpenY', 0.12 + wave * 0.7 * (0.55 + Math.random() * 0.45));
-            } else {
-                core.setParameterValueById('ParamMouthOpenY', 0);
-            }
-            return ok;
-        };
-    } catch (e) {
-        console.warn('[Live2D] 口型钩子失败', e);
-    }
-}
-
-// 情绪 → 动作映射（Hiyori 示例模型占位；换达妮娅模型后只需改这张表）
-const L2D_MOTION = {
-    happy: ['Idle', 3], love: ['Idle', 3], shy: ['Idle', 4],
-    angry: ['Idle', 7], sad: ['Idle', 1],
-    surprised: ['TapBody', 0], thinking: ['Idle', 8],
-    sleepy: ['Idle', 5], tired: ['Idle', 5],
-};
-
-function applyL2DEmotion(state) {
-    if (!_l2dReady || !_l2dModel) return;
-    if (state === 'idle' || state === 'speaking') return;
-    const mv = L2D_MOTION[state];
-    if (mv) {
-        try { _l2dModel.motion(mv[0], mv[1], 2); } catch (e) { }
-    }
-}
-
-function onVoicePlayback(playing) {
-    _l2dSpeaking = !!playing;
 }
 
 // ===== 顶栏天气胶囊 =====
@@ -628,6 +875,59 @@ function loadWeather() {
             } catch (e) { }
         }).catch(() => { });
     } catch (e) { }
+}
+
+// ===== 通用自绘提示框 =====
+// QWebEngine 的原生 title 提示框是空黑框，所以全部改成 data-tip + 自绘浮层
+let _tipBox = null;
+
+function _tipHide() {
+    if (_tipBox) _tipBox.style.display = 'none';
+}
+
+function _tipShow(target) {
+    const text = target.getAttribute('data-tip');
+    if (!text) return;
+    if (!_tipBox) {
+        _tipBox = document.createElement('div');
+        _tipBox.className = 'weather-tip-float';
+        document.body.appendChild(_tipBox);
+    }
+    _tipBox.textContent = text;
+    _tipBox.style.display = 'block';
+    const r = target.getBoundingClientRect();
+    const w = _tipBox.offsetWidth || 80;
+    let left = r.left + r.width / 2 - w / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
+    _tipBox.style.top = (r.bottom + 8) + 'px';
+    _tipBox.style.left = left + 'px';
+    _tipBox.style.right = 'auto';
+}
+
+document.addEventListener('mouseover', (e) => {
+    const t = e.target.closest && e.target.closest('[data-tip]');
+    if (t) _tipShow(t);
+});
+document.addEventListener('mouseout', (e) => {
+    const t = e.target.closest && e.target.closest('[data-tip]');
+    if (t && (!e.relatedTarget || !t.contains(e.relatedTarget))) _tipHide();
+});
+window.addEventListener('blur', _tipHide);
+
+// ===== Cloudflare WARP（启动页服务行）=====
+let _warpTimer = null;
+
+// 启动页「Cloudflare WARP」行：12s 轮询刷新状态（WARP 连接/断开走 start_service/stop_service）
+function scheduleWarpPoll() {
+    if (_warpTimer) return;
+    _warpTimer = setInterval(() => {
+        if (bridge && bridge.get_services) refreshServices();
+    }, 12000);
+}
+
+// WARP 状态更新回推：刷新启动页服务行
+function onWarpUpdated() {
+    if (bridge && bridge.get_services) refreshServices();
 }
 
 // ===== 电脑状态页 =====
@@ -725,7 +1025,7 @@ function setWorkspace(dotCls, title, sub, contentTitle, contentSub) {
 
 function collabBegin(goal) {
     collabHasTool = false;
-    collabToolCard = null;
+    collabOpenCards = [];
     document.getElementById('banner-goal').textContent =
         goal.length > 40 ? goal.slice(0, 40) + '…' : goal;
     setBannerState('working', '正在处理');
@@ -763,27 +1063,29 @@ function onToolEvent(jsonStr) {
         setWorkspace('working', '正在处理', '当前工具：' + displayName,
             displayName, '已允许，正在执行…');
 
-        collabToolCard = document.createElement('div');
-        collabToolCard.className = 'flow-item working';
-        collabToolCard.innerHTML =
+        const card = document.createElement('div');
+        card.className = 'flow-item working';
+        card.innerHTML =
             '<div class="flow-tag">已允许，正在执行</div>' +
             '<div class="flow-name"><span class="flow-spinner"></span>达妮娅准备调用：' + displayName + '</div>' +
             '<div class="flow-state">正在执行…</div>' +
             '<div class="flow-log"></div>';
-        collabToolCard.querySelector('.flow-log').textContent = ev.description || displayName;
-        list.appendChild(collabToolCard);
+        card.querySelector('.flow-log').textContent = ev.description || displayName;
+        list.appendChild(card);
+        collabOpenCards.push({ name: ev.name, el: card });
         list.scrollTop = list.scrollHeight;
     } else if (ev.type === 'tool_finish') {
         collabHasTool = true;
         const logText = cleanToolLog(ev.result) || '工具已完成';
-        if (collabToolCard) {
-            collabToolCard.className = 'flow-item done';
-            collabToolCard.innerHTML =
+        const doneCard = takeOpenCard(ev.name);
+        if (doneCard) {
+            doneCard.className = 'flow-item done';
+            doneCard.innerHTML =
                 '<div class="flow-tag">工具操作</div>' +
                 '<div class="flow-name"><span class="flow-check">✓</span>' + displayName + '</div>' +
                 '<div class="flow-state">已完成</div>' +
                 '<div class="flow-log"></div>';
-            collabToolCard.querySelector('.flow-log').textContent =
+            doneCard.querySelector('.flow-log').textContent =
                 '[' + ev.name + '] ' + logText;
         } else {
             // 极端情况下 start 事件丢失：补一张完成卡片
@@ -803,6 +1105,8 @@ function onToolEvent(jsonStr) {
     } else if (ev.type === 'tool_fail') {
         collabHasTool = true;
         collabRemoveThinking();
+        // 失败时把对应的"正在执行"卡片摘掉，避免留下永远转圈的卡片
+        takeOpenCard(ev.name);
         const card = document.createElement('div');
         card.className = 'flow-item error';
         card.innerHTML =
@@ -922,7 +1226,41 @@ function onServiceUpdated(jsonStr) {
     refreshServices();
 }
 
+// ===== 达妮娅发来的图片（page_image / image_search 等工具，桌面端无 QQ 会话时）=====
+function onImageMessage(raw) {
+    let data = {};
+    try { data = JSON.parse(raw || '{}'); } catch (e) { return; }
+    const imgs = data.images || [];
+    if (!imgs.length) return;
+    const box = document.getElementById('chat-messages');
+    if (!box) return;
+    const msg = document.createElement('div');
+    msg.className = 'msg msg-bot';
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble msg-bubble-img';
+    imgs.forEach(it => {
+        if (!it || !it.src) return;
+        const img = document.createElement('img');
+        img.className = 'msg-img';
+        img.alt = it.name || '图片';
+        img.src = it.src;
+        bubble.appendChild(img);
+    });
+    if (!bubble.children.length) return;
+    msg.appendChild(bubble);
+    box.appendChild(msg);
+    box.scrollTop = box.scrollHeight;
+}
+
 // ===== 设置页 =====
+function onBiliLoginFinished(raw) {
+    // 扫码登录结束：结果写进日志面板，并刷新设置行状态
+    let data = {};
+    try { data = JSON.parse(raw); } catch (e) { data = { text: String(raw) }; }
+    if (typeof onLog === 'function') onLog(`[B站登录] ${data.text || raw}`);
+    loadSettings();
+}
+
 function loadSettings() {
     if (!bridge || !bridge.get_settings) return;
     bridge.get_settings().then(raw => {
@@ -954,6 +1292,11 @@ function loadSettings() {
             } else if (s.type === 'hint') {
                 row.classList.add('setting-hint-row');
                 row.innerHTML = `<span class="set-hint">${s.label}</span>`;
+            } else if (s.type === 'action') {
+                row.innerHTML = `
+                    <span class="set-label">${s.label}</span>
+                    <span class="set-value">${s.value || ''}</span>
+                    <button class="btn-mini" data-action="${s.key}">${s.button || '执行'}</button>`;
             } else {
                 row.innerHTML = `
                     <span class="set-label">${s.label}</span>
@@ -982,6 +1325,16 @@ function loadSettings() {
             });
             inp.addEventListener('blur', () => {
                 bridge.save_setting(inp.dataset.key, inp.value);
+            });
+        });
+        // 操作按钮（扫码登录等）
+        container.querySelectorAll('.btn-mini').forEach(btn => {
+            btn.addEventListener('click', () => {
+                if (btn.dataset.action === 'bilibili_login' && bridge.start_bilibili_login) {
+                    btn.disabled = true;
+                    btn.textContent = '等待扫码…';
+                    bridge.start_bilibili_login();
+                }
             });
         });
     });

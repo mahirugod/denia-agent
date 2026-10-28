@@ -3,7 +3,7 @@ import re
 from typing import List, Dict, Tuple
 
 class DeniaChatbot:
-    def __init__(self, use_llm: bool = True, llm_model: str = "gpt-3.5-turbo", llm_api_key: str = "", llm_base_url: str = "", user_id: int = 0, use_voice: bool = True, voice_api_url: str = "http://127.0.0.1:9880"):
+    def __init__(self, use_llm: bool = True, llm_model: str = "gpt-3.5-turbo", llm_api_key: str = "", llm_base_url: str = "", user_id: int = 0, use_voice: bool = True, voice_api_url: str = "http://127.0.0.1:9880", history_key: str = "", allow_confirm: bool = True):
         self.name = "达妮娅"
         self.user_name = ""
         self.user_id = user_id  # 【新增】存储用户ID
@@ -15,7 +15,7 @@ class DeniaChatbot:
         if self.use_llm:
             try:
                 from denia_llm import DeniaLLM
-                self.llm = DeniaLLM(model_name=llm_model, api_key=llm_api_key, base_url=llm_base_url, user_id=user_id, is_group_chat=self.is_group_chat)
+                self.llm = DeniaLLM(model_name=llm_model, api_key=llm_api_key, base_url=llm_base_url, user_id=user_id, is_group_chat=self.is_group_chat, history_key=history_key, allow_confirm=allow_confirm)
                 print("LLM初始化成功")
             except Exception as e:
                 print(f"LLM初始化失败: {e}")
@@ -298,7 +298,11 @@ class DeniaChatbot:
         """
         # 如果使用LLM，直接调用LLM生成回复
         if self.use_llm:
-            response = self.llm.get_response(text, image_desc=image_desc)
+            # 与桌面端统一：走同一条流式 agent 链路（原生 function calling + 多步工具循环 +
+            # 新搜索路由 + 记忆提取 + 知识库）。此前走非流式 get_response，只能命中单个工具。
+            response = self.llm.get_response_stream(
+                text, on_sentence=None, on_delta=None, image_desc=image_desc
+            )
             
             # 更新对话历史
             self.update_conversation_history(text, response)
@@ -373,7 +377,7 @@ class DeniaChatbot:
     def get_vision_response(self, text: str, image_path: str) -> str:
         """看图/看屏幕回复（委托 LLM 视觉模型）"""
         if self.llm is None:
-            return "我看不到屏幕呢…检查一下Ollama开了没"
+            return "唔……我现在看不到屏幕呢。"
         reply = self.llm.get_vision_response(text, image_path)
         self.update_conversation_history(text, reply)
         return reply

@@ -32,15 +32,18 @@ class Harness:
     num_ctx: int              # Ollama 上下文窗口
     max_steps: int            # Agent 循环最大步数（1 = 单轮，不循环）
     needs_confirmation: bool  # 高危工具是否要用户确认
+    history_turns: int = 6   # 上下文窗口（取最近 N 条消息，即 N/2 轮）
 
 
 # 三档预设
+# standard 放宽到 0（不截断）：新增界面自动化后工具已超过 20 个，
+# 若仍截断会把 weather/web_search 这类核心工具挤掉。
 _TINY = Harness("tiny", max_tools=5, max_result_chars=160, num_ctx=768,
-                max_steps=1, needs_confirmation=True)
+                max_steps=1, needs_confirmation=True, history_turns=4)
 _SMALL = Harness("small", max_tools=9, max_result_chars=240, num_ctx=1024,
-                 max_steps=2, needs_confirmation=True)
-_STANDARD = Harness("standard", max_tools=15, max_result_chars=400, num_ctx=2048,
-                    max_steps=3, needs_confirmation=False)
+                 max_steps=2, needs_confirmation=True, history_turns=8)
+_STANDARD = Harness("standard", max_tools=0, max_result_chars=400, num_ctx=2048,
+                    max_steps=5, needs_confirmation=False, history_turns=12)
 
 
 def _detect_size(model_name: str) -> Optional[str]:
@@ -100,5 +103,6 @@ def pick_harness(model_name: str, override: str = "") -> Harness:
 
 def describe(h: Harness) -> str:
     """打印 harness 配置（启动日志用）"""
-    return (f"[Harness] {h.name}: 工具≤{h.max_tools} 结果≤{h.max_result_chars}字 "
+    tools_desc = "全部" if not h.max_tools else str(h.max_tools)
+    return (f"[Harness] {h.name}: 工具≤{tools_desc} 结果≤{h.max_result_chars}字 "
             f"ctx={h.num_ctx} 步数≤{h.max_steps} 确认={'开' if h.needs_confirmation else '关'}")

@@ -1,0 +1,8 @@
+# 文件操作技能
+name: file_ops
+description: 读写文件、查看目录、整理文件夹
+version: "1.0"
+tools: ["list_dir", "read_file", "write_file", "organize_folder"]
+depends: []
+min_harness: standard
+disabled: false

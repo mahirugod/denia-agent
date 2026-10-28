@@ -1,0 +1,8 @@
+# 系统调节技能
+name: system_control
+description: 调节系统音量与屏幕亮度
+version: "1.0"
+tools: ["set_volume", "set_brightness"]
+depends: []
+min_harness: standard
+disabled: false

@@ -6,7 +6,9 @@ TTS 多引擎抽象层（参考 Shinsekai 的 Adapter + Factory 模式）
 - GPTSoVITSAdapter: GPT-SoVITS HTTP 引擎（唯一引擎，失败即不发声）
 - TTSFactory: 引擎注册表 + 按优先级取可用引擎
 """
+import json
 import os
+import random
 import re
 import subprocess
 
@@ -34,12 +36,42 @@ class GPTSoVITSAdapter(TTSAdapter):
     ).replace("\\", "/")
     PROMPT_TEXT = "怎么啊？如果有你在也不放心，那就干脆给我也装个限制器或者炸弹喽。"
 
+    # 采样/语速参数文件（可调，让语气更自然）
+    _PARAMS_FILE = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "tts_params.json",
+    )
+    # 默认值（文件不存在时用）
+    _DEFAULTS = {
+        "temperature": 0.8,   # 偏低=平稳自然，偏高=起伏大；0.6~1.0 自然
+        "top_P": 0.8,
+        "top_K": 20,
+        "speed_factor": 1.0,  # 语速 1.0=正常，1.1=稍快，0.9=稍慢
+        "random_seed": True,  # True=每次随机采样（语气不重复），False=固定稳定
+    }
+
     def __init__(self, api_url: str = "http://127.0.0.1:9880"):
         self.api_url = api_url
+        self.params = self._load_params()
+
+    def _load_params(self) -> dict:
+        p = dict(self._DEFAULTS)
+        try:
+            if os.path.exists(self._PARAMS_FILE):
+                with open(self._PARAMS_FILE, "r", encoding="utf-8") as f:
+                    p.update(json.load(f))
+        except Exception as e:
+            print(f"[TTS] 读 tts_params.json 失败，用默认: {e}")
+        return p
 
     def synthesize(self, text: str, output_path: str) -> bool:
         try:
-            # POST JSON 避免 URL 编码路径问题
+            # 随机种子：每次换采样，语气不重复（设为 False 可回退固定 42）
+            if self.params.get("random_seed", True):
+                seed = random.randint(0, 100000)
+            else:
+                seed = 42
+
             payload = {
                 "text": text,
                 "text_lang": "zh",
@@ -50,7 +82,11 @@ class GPTSoVITSAdapter(TTSAdapter):
                 "batch_size": 1,
                 "media_type": "wav",
                 "streaming_mode": False,
-                "seed": 42,
+                "seed": seed,
+                "temperature": self.params.get("temperature", 0.8),
+                "top_P": self.params.get("top_P", 0.8),
+                "top_K": self.params.get("top_K", 20),
+                "speed_factor": self.params.get("speed_factor", 1.0),
             }
             response = requests.post(f"{self.api_url}/tts", json=payload, timeout=60)
             if response.status_code == 200 and len(response.content) > 100:
@@ -65,6 +101,10 @@ class GPTSoVITSAdapter(TTSAdapter):
 
     def is_available(self) -> bool:
         """轻量探测：服务是否在线（端口+模型就绪），不实际合成"""
+        import urllib.parse
+        parsed = urllib.parse.urlsplit(self.api_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 9880
         try:
             # 先尝试 /docs 或 /openapi.json（FastAPI 自带）
             response = requests.get(f"{self.api_url}/docs", timeout=3)
@@ -73,11 +113,11 @@ class GPTSoVITSAdapter(TTSAdapter):
         except Exception:
             pass
         try:
-            # 再试端口连通性
+            # 再试端口连通性（用 api_url 的 host:port，而非写死 127.0.0.1:9880）
             import socket
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(2)
-            s.connect(("127.0.0.1", 9880))
+            s.connect((host, port))
             s.close()
             return True
         except Exception:

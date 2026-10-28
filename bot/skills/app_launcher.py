@@ -66,6 +66,7 @@ _APP_MAP = {
     "publisher": "mspub",
     "浏览器": "msedge",
     "edge": "msedge",
+    "edge浏览器": "msedge",
     "谷歌": "chrome",
     "chrome": "chrome",
     "youtube": "start https://www.youtube.com",
@@ -126,6 +127,11 @@ def open_app(query: str) -> str:
     if not m:
         return None
     target = m.group(1).lower().strip()
+    # 截断句尾虚词/人称/追问词："打开edge浏览器你来查" → target 应为 "edge浏览器"
+    _TRAIL = re.compile(r'(?:帮我|帮|我来|你来|你来查|你来看看|你查|你帮|你帮我看|我帮|我们|你们|的话|吧|呢|啊|吗|哦|啦|了|的|一个|一|把|将|给|让|请|去|来|我|你|他|她|它|谁|啥|什么|如何|怎么|怎样|能不能|能否|可以|能|可|或|或者|还是)+$')
+    target = _TRAIL.sub('', target).strip()
+    if not target:
+        return None
 
     app = _APP_MAP.get(target)
     if app:

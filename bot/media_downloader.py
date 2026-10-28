@@ -6,11 +6,53 @@
 import os
 import re
 import json
+import time
 import requests
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+
+# 媒体缓存里会长期堆积的文件类型（下载的图、视频、QQ 收到的图）
+_CACHE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
+               ".mp4", ".webm", ".m4a", ".mp3", ".wav"}
+
+
+def cleanup_media_cache(days: int = 7, cache_root: str = "") -> int:
+    """清理超过 N 天的媒体缓存，返回删除的文件数。
+
+    同时扫两个可能的缓存根：项目根目录的 ./media_cache（默认 CWD 相对路径）
+    和 bot/media_cache（image_recognizer 收图用）。
+    """
+    cutoff = time.time() - days * 86400
+    roots = [cache_root,
+             str(Path(__file__).resolve().parent / "media_cache"),
+             str(Path.cwd() / "media_cache")]
+    removed = 0
+    seen = set()
+    for root in roots:
+        if not root:
+            continue
+        p = Path(root)
+        if not p.is_dir():
+            continue
+        key = str(p.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        for f in p.rglob("*"):
+            if not f.is_file() or f.suffix.lower() not in _CACHE_EXTS:
+                continue
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    if removed:
+        print(f"[缓存清理] 删除 {removed} 个超过 {days} 天的媒体文件")
+    return removed
+
 
 class MediaDownloader:
     """媒体下载管理器"""
@@ -53,31 +95,93 @@ class MediaDownloader:
     def search_bilibili_images(self, keyword: str, max_results: int = 5) -> List[Dict]:
         """
         图片搜索（改进方案）
-        由于网络限制，提供多个降级方案：
-        1. 尝试本地知识库的图片 URL
-        2. 使用百度搜索 API（通常更稳定）
-        3. 返回通用的图片占位符
+        优先级：
+        1. 本地知识库的图片 URL（命中即返回）
+        2. B站官方搜索 API（api.bilibili.com，最稳）
+        3. 百度图片搜索（正则兜底）
+        4. 返回通用图片源占位符
         
         返回 [{"title": "...", "url": "...", "cover": "..."}]
         """
         try:
-            # 【新增】先尝试本地知识库
+            # 【优先】本地知识库
             local_images = self._get_local_images(keyword)
             if local_images:
                 print(f"[本地知识库] 找到 {len(local_images)} 张图片")
                 return local_images[:max_results]
             
+            # 【B站官方API优先】
+            bili_images = self._search_bilibili_api(keyword, max_results)
+            if bili_images:
+                return bili_images
+            
             # 【降级1】尝试百度图片搜索 API
             baidu_images = self._search_baidu_images(keyword, max_results)
             if baidu_images:
                 return baidu_images
-            
-            # 【降级2】返回可用的图片源列表（B站、微博等）
-            return self._get_fallback_image_sources(keyword, max_results)
-            
+
+            # 都没找到，返回空（调用方自行提示失败）
+            print(f"[图片搜索] 未找到「{keyword}」的图片")
+            return []
+
         except Exception as e:
             print(f"[图片搜索] 异常: {e}")
-            return self._get_fallback_image_sources(keyword, max_results)
+            return []
+
+    def _search_bilibili_api(self, keyword: str, max_results: int = 5) -> List[Dict]:
+        """
+        B站官方搜索 API（无需登录即可拿到的部分）
+        用 type=2（用户）/type=3（视频）搜，视频封面图作为"图"。
+        对于"立绘/角色"类关键词，视频封面通常是官方角色展示，质量不错。
+        """
+        try:
+            import urllib.parse
+            # B站搜索 API：keyword 需 url-encode
+            encoded = urllib.parse.quote(keyword)
+            # type=3 视频搜索（封面图即角色立绘常见）
+            api_url = (
+                f"https://api.bilibili.com/x/web-interface/search/type"
+                f"?search_type=video&keyword={encoded}"
+            )
+            headers = {
+                **self.headers,
+                "Referer": "https://search.bilibili.com/",
+                "Origin": "https://search.bilibili.com",
+            }
+            resp = requests.get(api_url, headers=headers, timeout=8)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data.get("code") != 0:
+                print(f"[B站API] 返回错误 code={data.get('code')}")
+                return []
+
+            result_list = (data.get("data") or {}).get("result") or []
+            results = []
+            for item in result_list:
+                # 视频封面图（B站 CDN，稳定）
+                pic = item.get("pic") or item.get("title", "")
+                if pic.startswith("//"):
+                    pic = "https:" + pic
+                elif pic.startswith("http://"):
+                    pic = pic.replace("http://", "https://")
+                title = re.sub(r"<[^>]+>", "", item.get("title", ""))
+                if pic and "img.alicdn" in pic or pic.startswith("http"):
+                    results.append({
+                        "title": title,
+                        "url": pic,
+                        "cover": pic,
+                        "source": "bilibili_api",
+                    })
+                if len(results) >= max_results:
+                    break
+            if results:
+                print(f"[B站API] 找到 {len(results)} 张图片")
+            return results
+        except Exception as e:
+            print(f"[B站API] 失败: {e}")
+            return []
+
     
     def _get_local_images(self, keyword: str) -> List[Dict]:
         """从本地知识库获取已缓存的图片 URL"""
@@ -410,6 +514,37 @@ class MediaDownloader:
         
         return downloaded
     
+    def get_bilibili_video_info(self, video_url: str) -> dict:
+        """不下载视频，直接从 B站 API 拿封面图+标题+简介（零反爬）。
+
+        返回 {"title": str, "desc": str, "cover": str（图片 URL）, "duration": int}
+        失败返回空 dict。
+        """
+        bvid = self._extract_bvid(video_url)
+        if not bvid:
+            return {}
+        try:
+            # view API：拿封面/标题/简介/时长，无需 wbi 签名，带普通 UA 即可
+            api = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+            resp = requests.get(api, headers=self.headers, timeout=8)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") != 0:
+                print(f"[B站view] code={data.get('code')} msg={data.get('message','')}")
+                return {}
+            d = data.get("data") or {}
+            return {
+                "title": d.get("title", ""),
+                "desc": (d.get("desc") or "")[:300],
+                "cover": d.get("pic", ""),
+                "duration": d.get("duration", 0),  # 秒
+                "owner_name": (d.get("owner") or {}).get("name", ""),
+                "bvid": bvid,
+            }
+        except Exception as e:
+            print(f"[B站view] 请求失败: {e}")
+            return {}
+
     def cleanup_old_files(self, days: int = 7):
         """清理7天前的缓存文件"""
         import time

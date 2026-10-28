@@ -1,0 +1,8 @@
+# 发消息技能（NapCat / QQ）
+name: messaging
+description: 通过本机 NapCat 给 QQ 好友或群发消息
+version: "1.0"
+tools: ["send_message"]
+depends: []
+min_harness: standard
+disabled: false

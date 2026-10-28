@@ -179,9 +179,80 @@ def encode_image_base64(image_path: str) -> Optional[str]:
         return None
 
 
+def _cloud_vision_config():
+    """从 settings.json 取云端视觉配置，返回 (model, api_key, base_url)；不可用时返回 None
+
+    QQ 端识图固定优先走 agnes（桌面端切本地模型时也不受影响），
+    仅在没有云端凭据时才回落到本地 Ollama 视觉模型。
+    """
+    import json
+    settings_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "settings.json"
+    )
+    try:
+        with open(settings_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return None
+    key = cfg.get("cloud_api_key") or ""
+    base = (cfg.get("cloud_base_url") or "").rstrip("/")
+    if not (key and base):
+        return None
+    model = cfg.get("model_name") or ""
+    if model.startswith("cloud:"):
+        model = model[len("cloud:"):]
+    elif not model.startswith("agnes"):
+        model = "agnes-3.0-flash"   # 本地模型配置下，QQ 识图仍用 agnes
+    return model, key, base
+
+
+def _recognize_image_cloud(image_path: str, prompt: str) -> Optional[str]:
+    """云端多模态识图（agnes / 通用云端 OpenAI 格式），失败返回 None 交给本地兜底"""
+    conf = _cloud_vision_config()
+    if not conf:
+        return None
+    model, key, base = conf
+    b64 = encode_image_base64(image_path)
+    if not b64:
+        return None
+    data = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ],
+            }
+        ],
+        "stream": False,
+        "max_tokens": 512,
+    }
+    try:
+        print(f"[识图] 调用云端 {model} 识图...")
+        resp = requests.post(
+            f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=data,
+            timeout=90,
+        )
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"].strip()
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+        if text:
+            print(f"[识图] 云端识别成功 ({len(text)}字)")
+            return text
+        print("[识图] 云端返回空，回落到本地视觉模型")
+    except Exception as e:
+        print(f"[识图] 云端识别失败，回落到本地视觉模型: {e}")
+    return None
+
+
 def recognize_image(image_path: str, prompt: str = None) -> Optional[str]:
     """
-    调用 Ollama 视觉模型识别图片
+    识别图片：优先云端 agnes 多模态，失败再回落本地 Ollama 视觉模型
 
     Args:
         image_path: 图片本地路径
@@ -192,6 +263,10 @@ def recognize_image(image_path: str, prompt: str = None) -> Optional[str]:
     """
     if prompt is None:
         prompt = "请用中文生动描述这张图片的内容。描述人物的发色、瞳色、服装、表情、姿势、背景环境、画面氛围。如果是动漫/游戏角色，尽可能说出名字和出处。描述要详细，让没看到图片的人也能想象出画面。100-200字。"
+
+    _cloud = _recognize_image_cloud(image_path, prompt)
+    if _cloud:
+        return _cloud
 
     try:
         # 编码图片为 base64

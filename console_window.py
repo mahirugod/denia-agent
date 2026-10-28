@@ -8,6 +8,9 @@
 """
 import os
 import json
+import time
+import base64
+import threading
 
 from PySide6.QtCore import QObject, Slot, Signal, QUrl, Qt, QEvent
 from PySide6.QtGui import QColor
@@ -29,8 +32,12 @@ class BridgeObject(QObject):
 
     # → JS 的信号
     chat_started = Signal()            # 流式开始
-    chat_delta = Signal(str)           # 流式增量
-    chat_finished = Signal(str)        # 流式结束（带完整文本）
+    chat_delta = Signal(str)           # 流式增量（逐字追加到气泡）
+    chat_stall = Signal(str)           # 首字未到：气泡先显示占位回应
+    chat_clear = Signal()              # 真实内容到达：清掉占位文字
+    chat_partial = Signal(str)         # 流式语音识别实时文本（空串=清空）
+    chat_finished = Signal(str)        # 流式结束通知；参数为错误提示（成功时为空串）
+    chat_thinking = Signal(str)        # 思考链（reasoning，折叠区展示）
     chat_failed = Signal(str)          # 出错
     service_updated = Signal(str)      # 服务状态更新（JSON 字符串）
     tool_event = Signal(str)           # 工具执行事件（JSON，协作流）
@@ -38,10 +45,12 @@ class BridgeObject(QObject):
     win_state_changed = Signal(bool)   # 最大化状态变化
     reminder_fired = Signal(str)       # 定时提醒到点（提醒内容）
     emotion_changed = Signal(str)      # 情绪状态变化（idle/happy/sleepy/angry...）
-    voice_playback = Signal(bool)      # 语音正在播放（Live2D 口型同步）
     weather_updated = Signal(str)      # 天气更新（JSON 字符串）
     system_updated = Signal(str)       # 电脑状态更新（JSON 字符串）
+    warp_updated = Signal(str)         # WARP 状态更新（JSON 字符串）
+    bili_login_finished = Signal(str)  # B站扫码登录结果（JSON：{ok, text}）
     user_message = Signal(str)         # 语音识别用户文本（回显为用户气泡）
+    image_message = Signal(str)        # 达妮娅发来的图片（JSON：{images:[{src,name}]}）
 
     def __init__(self, app):
         super().__init__()
@@ -56,6 +65,73 @@ class BridgeObject(QObject):
         if not text:
             return
         self.app.console_send_message(text)
+
+    @Slot(str, str, str)
+    def send_image(self, b64: str, filename: str, text: str):
+        """JS 调用：发图（原图直传视觉模型，不做文字描述中转）
+
+        b64 为前端 canvas 压缩后的 base64（可能带 data URI 前缀）；
+        text 是用户随图输入的文字，空则用默认提问。
+        """
+        if not b64:
+            return
+        try:
+            raw = base64.b64decode(b64.split(",", 1)[-1])
+        except Exception as exc:
+            self.chat_finished.emit(f"这张图我打不开呢（{str(exc)[:40]}）")
+            return
+
+        upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "data", "uploads")
+        try:
+            os.makedirs(upload_dir, exist_ok=True)
+            ext = os.path.splitext(filename or "")[1].lower()
+            if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"):
+                ext = ".jpg"
+            path = os.path.join(upload_dir, f"img_{int(time.time() * 1000)}{ext}")
+            with open(path, "wb") as f:
+                f.write(raw)
+        except Exception as exc:
+            self.chat_finished.emit(f"图片没存下来呢（{str(exc)[:40]}）")
+            return
+
+        prompt = (text or "").strip() or "这张图里有什么？用你的口吻跟我讲讲。"
+        hint = f"[用户发来一张图片] {text}".strip()
+
+        def work():
+            # 与文字流共用一把会话锁：前一轮流式没结束时先等它说完
+            lock = getattr(self.app.controller, "_chat_lock", None)
+            held = False
+            if lock is not None:
+                try:
+                    held = lock.acquire(timeout=180)
+                except Exception:
+                    held = False
+            try:
+                self.chat_started.emit()
+                self.emotion_changed.emit("thinking")
+                reply = ""
+                try:
+                    llm = getattr(getattr(self.app.controller, "_bot", None), "llm", None)
+                    if llm is None:
+                        reply = "唔……我的眼睛还没准备好呢，等一下再试试？"
+                    else:
+                        reply = llm.get_vision_response(prompt, path) or ""
+                        try:
+                            llm.update_history("user", hint)
+                            llm.update_history("assistant", reply)
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    reply = f"看图的时候出了点问题…（{str(exc)[:50]}）"
+                self.chat_delta.emit(reply or "嗯……我好像没看清呢，再说一次嘛？")
+                self.chat_finished.emit("")
+                self.emotion_changed.emit("idle")
+            finally:
+                if held:
+                    lock.release()
+
+        threading.Thread(target=work, name="console-vision", daemon=True).start()
 
     @Slot()
     def interrupt_voice(self):
@@ -106,6 +182,80 @@ class BridgeObject(QObject):
         except Exception:
             return "{}"
 
+    # ===== Cloudflare WARP =====
+    @Slot(result=str)
+    def get_warp_status(self) -> str:
+        """JS 调用：获取 WARP 状态（JSON）"""
+        try:
+            return self.app.get_warp_status()
+        except Exception:
+            return "{}"
+
+    @Slot(result=str)
+    def get_recent_logs(self) -> str:
+        """JS 调用：控制台打开时拉取之前的日志（JSON 数组）"""
+        try:
+            return self.app.get_recent_logs()
+        except Exception:
+            return "[]"
+
+    @Slot(result=str)
+    def get_recent_traces(self) -> str:
+        """JS 调用：拉取最近 30 轮 QQ 对话（JSON 数组）"""
+        try:
+            return self.app.get_recent_traces()
+        except Exception:
+            return "[]"
+
+    @Slot()
+    def toggle_warp(self):
+        """JS 调用：切换 WARP（后台线程执行，结果通过 warp_updated 回推）"""
+        def work():
+            try:
+                data = self.app.toggle_warp()
+            except Exception as e:
+                data = {"available": True, "state": "error", "connected": False,
+                        "text": f"切换失败: {str(e)[:60]}"}
+            self.warp_updated.emit(json.dumps(data, ensure_ascii=False))
+
+        threading.Thread(target=work, name="warp-toggle", daemon=True).start()
+
+    @Slot()
+    def start_bilibili_login(self):
+        """JS 调用：打开 B站 扫码登录窗口，成功后自动写入 settings.json"""
+        try:
+            from bilibili_login import BiliLoginDialog
+
+            storage = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "webengine_bili")
+            dlg = BiliLoginDialog(self, storage_dir=storage)
+
+            state = {"ok": False}
+
+            def _saved(sesdata, jct):
+                try:
+                    self.app.save_bilibili_cookie(sesdata, jct)
+                    payload = {"ok": True, "text": "B站 登录成功，官号动态已启用"}
+                    state["ok"] = True
+                except Exception as exc:
+                    payload = {"ok": False, "text": f"保存失败: {str(exc)[:80]}"}
+                self.bili_login_finished.emit(json.dumps(payload, ensure_ascii=False))
+
+            def _closed(_result):
+                # 用户直接关窗/取消：把按钮状态恢复回去
+                if not state["ok"]:
+                    self.bili_login_finished.emit(
+                        json.dumps({"ok": False, "text": "已取消扫码登录"}, ensure_ascii=False))
+
+            dlg.logged_in.connect(_saved)
+            dlg.logged_in.connect(lambda *_: dlg.accept())
+            dlg.finished.connect(_closed)
+            dlg.setAttribute(Qt.WA_DeleteOnClose)
+            self._bili_dlg = dlg  # 持有引用，防止被 GC
+            dlg.show()
+        except Exception as exc:
+            payload = {"ok": False, "text": f"打开登录窗口失败: {str(exc)[:80]}"}
+            self.bili_login_finished.emit(json.dumps(payload, ensure_ascii=False))
+
     # ===== 任务/提醒 =====
     @Slot(result=str)
     def get_tasks(self) -> str:
@@ -128,18 +278,33 @@ class BridgeObject(QObject):
 
     @Slot(str)
     def start_service(self, name: str):
-        """JS 调用：启动服务（napcat 连带启动 bot）"""
+        """JS 调用：启动服务（napcat 连带启动 bot；warp 走 WARP 连接）"""
+        if name == "warp":
+            def work():
+                try:
+                    self.app.warp_start()
+                except Exception as e:
+                    print(f"[WARP] 连接失败: {e}")
+            threading.Thread(target=work, name="warp-start-bridge", daemon=True).start()
+            return
         self.app.process_mgr.start_service(name)
         if name == "napcat":
-            import threading, time
-            def _start_bot():
-                time.sleep(3)  # 等待 NapCat WebSocket 就绪
-                self.app.process_mgr.start_service("bot")
-            threading.Thread(target=_start_bot, daemon=True).start()
+            # 等待 NapCat WebSocket 就绪再拉机器人（QTimer 不阻塞界面）
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(
+                3000, lambda: self.app.process_mgr.start_service("bot"))
 
     @Slot(str)
     def stop_service(self, name: str):
-        """JS 调用：停止服务（napcat 连带停止 bot）"""
+        """JS 调用：停止服务（napcat 连带停止 bot；warp 走 WARP 断开）"""
+        if name == "warp":
+            def work():
+                try:
+                    self.app.warp_stop()
+                except Exception as e:
+                    print(f"[WARP] 断开失败: {e}")
+            threading.Thread(target=work, name="warp-stop-bridge", daemon=True).start()
+            return
         if name == "napcat":
             self.app.process_mgr.stop_service("bot")
         self.app.process_mgr.stop_service(name)
@@ -171,7 +336,10 @@ class BridgeObject(QObject):
     # ===== 无边框窗口控制 =====
     @Slot()
     def minimize_window(self):
-        if self.win:
+        """JS 调用：最小化 → 收成右下角悬浮小人"""
+        if hasattr(self.app, "_show_pet"):
+            self.app._show_pet()
+        elif self.win:
             self.win.showMinimized()
 
     @Slot()
@@ -191,6 +359,11 @@ class BridgeObject(QObject):
     def close_window(self):
         if self.win:
             self.win.close()  # closeEvent 里隐藏而非销毁
+
+    @Slot()
+    def show_pet(self):
+        """JS 调用：切换为悬浮小人（双击小人回到控制台）"""
+        self.app._show_pet()
 
     @Slot()
     def drag_window(self):
@@ -241,7 +414,7 @@ class ConsoleWindow(QWidget):
         # 页面底色设为深色，消除默认白底在窗口边缘/加载时露出的白边
         self.view.page().setBackgroundColor(QColor("#020814"))
         self.view.setStyleSheet("border: none; background: #020814;")
-        # 允许 file:// 页面 fetch 本地资源（Live2D 模型 JSON/贴图加载需要）
+        # 允许 file:// 页面访问本地资源（贴图/本地 JSON 等）
         settings = self.view.page().settings()
         settings.setAttribute(
             settings.WebAttribute.LocalContentCanAccessFileUrls, True)

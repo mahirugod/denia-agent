@@ -1,0 +1,8 @@
+# 剪贴板技能
+name: clipboard
+description: 读写系统剪贴板
+version: "1.0"
+tools: ["read_clipboard", "write_clipboard"]
+depends: []
+min_harness: standard
+disabled: false
