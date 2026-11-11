@@ -13,7 +13,7 @@ import base64
 import threading
 
 from PySide6.QtCore import QObject, Slot, Signal, QUrl, Qt, QEvent
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QApplication
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
@@ -35,8 +35,13 @@ class BridgeObject(QObject):
     chat_delta = Signal(str)           # 流式增量（逐字追加到气泡）
     chat_stall = Signal(str)           # 首字未到：气泡先显示占位回应
     chat_clear = Signal()              # 真实内容到达：清掉占位文字
+    voice_rhythm = Signal(float)       # 每字毫秒：前端打字机跟上语速
+    voice_segment = Signal(str, float) # 本段显示文本 + 时长ms：前端按段内时钟揭示
+    voice_stream_end = Signal()        # 本轮语音播完：补齐尾巴并定稿
+    voice_replay_state = Signal(bool)  # 气泡语音重播状态：True=播放中，False=结束/打断
     chat_partial = Signal(str)         # 流式语音识别实时文本（空串=清空）
     chat_finished = Signal(str)        # 流式结束通知；参数为错误提示（成功时为空串）
+    chat_final = Signal(str)           # 最终清洗文本（流结束后推一次，前端兜底替换气泡）
     chat_thinking = Signal(str)        # 思考链（reasoning，折叠区展示）
     chat_failed = Signal(str)          # 出错
     service_updated = Signal(str)      # 服务状态更新（JSON 字符串）
@@ -154,6 +159,32 @@ class BridgeObject(QObject):
         except Exception:
             pass
 
+    @Slot(str, result=bool)
+    def copy_image(self, src: str) -> bool:
+        """JS 调用：把图片复制到剪贴板（src 支持 data URI 或 http URL）"""
+        if not src:
+            return False
+        try:
+            if src.startswith("data:"):
+                raw = base64.b64decode(src.split(",", 1)[-1])
+            else:
+                import requests
+                resp = requests.get(src, headers={
+                    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/120.0 Safari/537.36"),
+                }, timeout=8)
+                resp.raise_for_status()
+                raw = resp.content
+            img = QImage()
+            if not img.loadFromData(raw) or img.isNull():
+                return False
+            QApplication.clipboard().setImage(img)
+            return True
+        except Exception as e:
+            print(f"[复制图片] 失败: {e}")
+            return False
+
     # ===== 记忆 =====
     @Slot(result=str)
     def get_memories(self) -> str:
@@ -199,14 +230,6 @@ class BridgeObject(QObject):
         except Exception:
             return "[]"
 
-    @Slot(result=str)
-    def get_recent_traces(self) -> str:
-        """JS 调用：拉取最近 30 轮 QQ 对话（JSON 数组）"""
-        try:
-            return self.app.get_recent_traces()
-        except Exception:
-            return "[]"
-
     @Slot()
     def toggle_warp(self):
         """JS 调用：切换 WARP（后台线程执行，结果通过 warp_updated 回推）"""
@@ -227,7 +250,8 @@ class BridgeObject(QObject):
             from bilibili_login import BiliLoginDialog
 
             storage = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "webengine_bili")
-            dlg = BiliLoginDialog(self, storage_dir=storage)
+            # 不传 self 作 parent：主窗口隐藏/销毁时不会连带对话框，也规避 parent 类型异常
+            dlg = BiliLoginDialog(storage_dir=storage)
 
             state = {"ok": False}
 
@@ -265,6 +289,14 @@ class BridgeObject(QObject):
             return json.dumps(tasks, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": str(e)})
+
+    @Slot(int)
+    def complete_task(self, index: int):
+        """JS 调用：勾选完成某条任务（取消对应提醒）"""
+        try:
+            self.app.complete_task(index)
+        except Exception:
+            pass
 
     # ===== 服务状态 =====
     @Slot(result=str)

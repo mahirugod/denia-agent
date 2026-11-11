@@ -297,7 +297,7 @@ class KnowledgeBase:
                 best_file = filename
         return best_file if best_score > 0 else None
 
-    def _extract_relevant(self, content: str, query: str, max_chars: int = 800) -> str:
+    def _extract_relevant(self, content: str, query: str, max_chars: int = 500) -> str:
         """从知识库内容中提取与查询最相关的段落（2-gram 中文分词，召回更准）"""
         paragraphs = [p.strip() for p in re.split(r"\n{2,}", content) if p.strip()]
         # 去掉段落里的注释/分隔线（# ---- / # 【xx】），只保留正文；
@@ -386,7 +386,7 @@ class KnowledgeBase:
         except Exception:
             return ""
 
-    def _query_book_notes(self, user_input: str, max_chars: int = 900) -> Optional[str]:
+    def _query_book_notes(self, user_input: str, max_chars: int = 600) -> Optional[str]:
         """在 bot/books/*/notes/*.md 里找与提问最相关的笔记段落"""
         if not os.path.isdir(BOOKS_DIR):
             return None

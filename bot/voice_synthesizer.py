@@ -242,6 +242,66 @@ class VoiceSynthesizer:
                 except OSError:
                     pass
 
+    def synthesize_stream(self, text: str, output_path: str, on_start=None,
+                          on_frames=None, should_stop=None, first=False):
+        """流式合成：边收边回调 PCM（供增量播放）。
+
+        first=True 表示本轮第一句：允许引擎用更激进的切分抢先出声。
+        返回 (samplerate, channels, sampwidth, frames)；完全失败返回 None。
+        单段优先走引擎 streaming_mode；超长句沿用整段合成后按块喂给播放层。
+        """
+        cleaned = self._clean_text_for_tts(text)
+        if not cleaned:
+            print("[TTS] 文本清理后为空，跳过流式合成")
+            return None
+        cleaned = normalize_for_tts(cleaned)
+        segments = self._split_text_for_tts(cleaned, max_len=80)
+        if len(segments) > 1:
+            # 超长句：GPT-SoVITS 对流式长文本不稳定，整段合成后按块喂
+            if not self.synthesize(text, output_path):
+                return None
+            return self._feed_wav_file(output_path, on_start, on_frames, should_stop)
+
+        for adapter in self._get_engine_chain():
+            if hasattr(adapter, "synthesize_stream"):
+                info = adapter.synthesize_stream(
+                    segments[0], output_path, on_start=on_start,
+                    on_frames=on_frames, should_stop=should_stop, first=first)
+                if info:
+                    self._last_engine_name = adapter.name
+                    return info
+        # 引擎不支持流式或首块失败（此时尚未播出任何帧）→ 整段合成后按块喂
+        if self.synthesize(text, output_path):
+            return self._feed_wav_file(output_path, on_start, on_frames, should_stop)
+        return None
+
+    @staticmethod
+    def _feed_wav_file(wav_path, on_start=None, on_frames=None, should_stop=None):
+        """把已合成好的 wav 按块喂给播放层（流式不可用时的稳定回落）。"""
+        import wave
+
+        try:
+            with wave.open(wav_path, "rb") as wf:
+                sr = wf.getframerate()
+                ch = wf.getnchannels()
+                width = wf.getsampwidth()
+                total = 0
+                if on_start is not None:
+                    on_start(sr, ch, width)
+                while True:
+                    if should_stop is not None and should_stop():
+                        break
+                    data = wf.readframes(4096)
+                    if not data:
+                        break
+                    total += len(data) // max(1, width * ch)
+                    if on_frames is not None:
+                        on_frames(data)
+                return (sr, ch, width, total)
+        except Exception as e:
+            print(f"[TTS] 整段音频转流式失败: {e}")
+            return None
+
     def _get_engine_chain(self, force_refresh: bool = False) -> list:
         """按优先级返回可用引擎列表（缓存5分钟）"""
         now = time.time()

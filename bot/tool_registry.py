@@ -3,7 +3,7 @@
 """
 轻量插件/工具注册表（参考 Shinsekai sdk/tool_registry 的 @tool 装饰器模式）
 - @tool 装饰器注册工具（名称/描述/触发关键词）
-- match_tool: 按用户消息关键词路由到工具（快路径）
+- match_tool: 按用户消息关键词找出可能的工具（只作候选/兜底，最终由模型决定用不用）
 - model_pick_tool: 模型自报工具名的解析（慢路径，配合双通道）
 - 工具返回上下文文本，由 LLM 以达妮娅人设转述（不破坏人设）
 """
@@ -27,6 +27,11 @@ class ToolInfo:
 
 # 全局注册表
 _TOOLS: dict = {}
+
+# 注册表版本号：每注册一个工具就 +1，工具清单/原生 schema 按版本缓存。
+# 工具通常在启动时一次性注册完，缓存命中后每轮不用再重新拼字符串和 JSON。
+_REG_VERSION = 0
+_MANIFEST_CACHE: dict = {}
 
 # ── 访客权限门（QQ 群聊/非主人私聊）──
 # 本机操作类工具（打开应用、截屏、UI 自动化、文件、剪贴板、音量亮度…）只允许主人触发。
@@ -77,6 +82,9 @@ def tool(name: str, description: str, keywords: list = None, patterns: list = No
          parameters: dict = None):
     """工具注册装饰器"""
     def deco(fn: Callable):
+        global _REG_VERSION
+        _REG_VERSION += 1
+        _MANIFEST_CACHE.clear()
         _TOOLS[name] = ToolInfo(
             name=name,
             description=description,
@@ -183,14 +191,36 @@ def match_tool(query: str) -> Optional[ToolInfo]:
     return cands[0][2]
 
 
+def _fail_msg(name: str, err: str) -> str:
+    """把工具失败变成模型能读懂的提示：告诉它为什么失败、下一步怎么补。
+
+    以前这里返回 None，模型看到的是"什么都没发生"，于是要么编一个答案，
+    要么干脆沉默（就是"脑袋里一片空白"）。现在把原因回灌，让它自己换路。
+    """
+    err = (err or "").strip().replace("\n", " ")[:140]
+    _note_tool(name, failed=True)
+    return (f"（系统：{name} 执行失败：{err or '未知原因'}。"
+            f"可以换个同类工具或换个关键词/来源再试一次；实在不行就直接告诉用户做不到）")
+
+
+def _note_tool(name: str, failed: bool = False):
+    """给 metrics 打点（失败静默，不让统计影响主流程）"""
+    try:
+        import metrics
+        metrics.note_tool(name, failed)
+    except Exception:
+        pass
+
+
 def execute_tool(info: ToolInfo, query: str) -> Optional[str]:
     """
     执行工具，返回注入 LLM 的上下文文本。
-    工具内部异常不应中断聊天，返回 None 则跳过注入。
+    工具内部异常不应中断聊天；失败时返回可读的失败原因，让模型自己换路。
     """
     if not is_tool_allowed(info.name):
         print(f"[权限] 访客请求本机工具 {info.name}，已拦截")
-        return None
+        return f"（系统：当前是访客会话，{info.name} 这类本机操作不可用，直接说明做不到）"
+    _note_tool(info.name)
     _emit_event({
         "type": "tool_start",
         "name": info.name,
@@ -202,7 +232,7 @@ def execute_tool(info: ToolInfo, query: str) -> Optional[str]:
         handled, result, iso_err = tool_runner.try_run(info.name, query)
         if handled and iso_err:
             print(f"[工具] {info.name} 子进程失败: {iso_err}")
-            result = None
+            result = _fail_msg(info.name, iso_err)
         elif not handled:
             result = info.handler(query)
         _emit_event({
@@ -220,7 +250,7 @@ def execute_tool(info: ToolInfo, query: str) -> Optional[str]:
             "description": info.description,
             "error": str(e),
         })
-        return None
+        return _fail_msg(info.name, f"{type(e).__name__}: {e}")
 
 
 def get_tool(name: str) -> Optional[ToolInfo]:
@@ -237,7 +267,8 @@ def _execute_named(info: ToolInfo, named: dict) -> Optional[str]:
     """
     if not is_tool_allowed(info.name):
         print(f"[权限] 访客请求本机工具 {info.name}，已拦截")
-        return None
+        return f"（系统：当前是访客会话，{info.name} 这类本机操作不可用，直接说明做不到）"
+    _note_tool(info.name)
     _emit_event({
         "type": "tool_start",
         "name": info.name,
@@ -261,7 +292,7 @@ def _execute_named(info: ToolInfo, named: dict) -> Optional[str]:
             "description": info.description,
             "error": str(e),
         })
-        return None
+        return _fail_msg(info.name, f"{type(e).__name__}: {e}")
 
 
 def execute_tool_args(info: ToolInfo, args: dict, fallback_query: str = "") -> Optional[str]:
@@ -277,7 +308,13 @@ def execute_tool_args(info: ToolInfo, args: dict, fallback_query: str = "") -> O
         if not props:
             return _execute_named(info, {})
         named = {k: args[k] for k in props if k in args}
-        if named and not ({"query", "keyword"} & set(props)):
+        if not ({"query", "keyword"} & set(props)):
+            _bad = _validate_args(info, args)
+            if _bad:
+                print(f"[工具] {info.name} 参数校验未过，不执行，让模型改参重试")
+                return _bad
+            # 结构化参数工具：模型一个参数都没给时也要走命名调用，让函数用自己的默认值，
+            # 否则会把用户原话整句当成第一个参数（如 slug）传进去
             return _execute_named(info, named)
 
     q = str(args.get("query") or "").strip()
@@ -288,6 +325,9 @@ def execute_tool_args(info: ToolInfo, args: dict, fallback_query: str = "") -> O
             _cnt = args.get("count")
             if _cnt:
                 q += f" {_cnt}张"
+            _gid = args.get("group_id")
+            if _gid:
+                q += f" 群{_gid}"
     if not q:
         q = (fallback_query or "").strip()
     return execute_tool(info, q)
@@ -335,26 +375,168 @@ def _query_schema(name: str) -> dict:
     }
 
 
+# ── 参数值域补丁：在不改各 skill 文件的前提下，给模型看到上下界 ──
+# 网关没有 DeepInfer 那种解码期约束（so_args 的 regex / json_schema / ebnf
+# 是在采样时屏蔽非法 token），我们改不了解码，只能"事前把 schema 写死 +
+# 调用前校验"两边逼近。这里补的是模型最容易给错的那几个数值参数。
+_PARAM_PATCH = {
+    "page_image": {"count": {"minimum": 1, "maximum": 6}},
+    "x_image_search": {"count": {"minimum": 1, "maximum": 10}},
+    "run_python": {"timeout": {"minimum": 5, "maximum": 60}},
+}
+
+
+def _patched_schema(info) -> dict:
+    """工具自带 schema + 值域补丁（只叠加约束，不改结构）"""
+    base = dict(info.parameters or {})
+    patch = _PARAM_PATCH.get(info.name)
+    props = base.get("properties")
+    if not patch or not isinstance(props, dict):
+        return base
+    merged = dict(props)
+    for key, extra in patch.items():
+        if key in merged and isinstance(merged[key], dict):
+            prop = dict(merged[key])
+            prop.update(extra)
+            merged[key] = prop
+    base["properties"] = merged
+    return base
+
+
+def _check_value(key: str, val, spec: dict) -> Optional[str]:
+    """单个参数的值域校验，返回给模型读的错误句（None = 通过）"""
+    typ = spec.get("type")
+    if typ == "integer" and not isinstance(val, int):
+        # 模型常把数字写成字符串（"3"），能转就放行，转不了才报错
+        try:
+            val = int(str(val).strip())
+        except (TypeError, ValueError):
+            return f"参数 {key} 要是整数，你给的是 {val!r}"
+    if typ == "string" and isinstance(val, (int, float)) and not isinstance(val, bool):
+        return f"参数 {key} 要是文本，你给的是 {val!r}"
+    enum = spec.get("enum")
+    if enum and val not in enum:
+        return f"参数 {key} 只能是 {'/'.join(str(e) for e in enum)}，你给的是 {val!r}"
+    if isinstance(val, int) and not isinstance(val, bool):
+        lo, hi = spec.get("minimum"), spec.get("maximum")
+        if lo is not None and val < lo:
+            return f"参数 {key} 最小是 {lo}，你给的是 {val}"
+        if hi is not None and val > hi:
+            return f"参数 {key} 最大是 {hi}，你给的是 {val}"
+    return None
+
+
+def _validate_args(info, args: dict) -> Optional[str]:
+    """按 schema 校验结构化参数，返回回灌给模型的说明（None = 放行）。
+
+    以前校验没有这一层：必填参数缺失时直接把用户原话顶进去（"把用户原话
+    当 slug"就是这么来的），数值越界也不管。现在不合规就不执行，把错因
+    告诉模型，让它带着修正重新调一次。
+    """
+    schema = _patched_schema(info)
+    props = schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return None
+    args = args if isinstance(args, dict) else {}
+    required = schema.get("required") or []
+    missing = [k for k in required if not str(args.get(k, "")).strip()]
+    if missing:
+        return (f"（系统：{info.name} 参数不完整，缺少 {', '.join(missing)}。"
+                f"按 schema 补齐后重新调用一次）")
+    for key, val in args.items():
+        spec = props.get(key)
+        if not isinstance(spec, dict) or val in (None, ""):
+            continue
+        err = _check_value(key, val, spec)
+        if err:
+            return f"（系统：{info.name} 的{err}。改好参数再调用一次）"
+    return None
+
+
 def build_tool_schemas(limit: int = 0) -> list:
     """
     生成原生 function calling 的 tools 数组。
     limit: 0=全部；>0 时按注册顺序取前 N 个（配合 harness.max_tools）。
     工具自带 parameters 时优先用它，否则用统一单参数 query schema。
+
+    description 只保留首句（到第一个句号/分号）：39 个工具全量下发时，
+    长描述会白烧几千 token，把首字延迟拉长；首句已含核心用途与触发场景。
     """
+    # 权限门是线程级开关（访客/主人看到的工具表不同），必须一起进缓存键
+    _key = ("schemas", _REG_VERSION, limit if limit and limit > 0 else 0,
+            is_remote_restricted())
+    _hit = _MANIFEST_CACHE.get(_key)
+    if _hit is not None:
+        return _hit
     tools = [t for t in _TOOLS.values() if is_tool_allowed(t.name)]
     if limit and limit > 0:
         tools = tools[:limit]
-    return [
+    out = [
         {
             "type": "function",
             "function": {
                 "name": t.name,
-                "description": t.description,
-                "parameters": t.parameters or _query_schema(t.name),
+                "description": _short_desc(_TOOL_DESC.get(t.name) or t.description),
+                "parameters": _patched_schema(t) if t.parameters else _query_schema(t.name),
             },
         }
         for t in tools
     ]
+    _MANIFEST_CACHE[_key] = out
+    return out
+
+
+# ── 模型看到的工具说明（覆盖 skill 文件里给人看的版本）──
+# 模型只靠这一句判断"该不该用这个工具"，所以统一写成：
+# 干什么 + 什么时候用 + 什么情况别用（和谁容易混）。超过 110 字会被截断。
+_TOOL_DESC = {
+    "web_search": "联网查外部事实：新闻、价格、最新动态、人物/游戏/作品/政策等你拿不准的信息；本地状态（推理耗时、哪个模型）和常识别用它",
+    "browse_url": "打开一个具体网址读内容（网页正文、B站视频简介、图片直链）；手上没有具体 URL 时用 web_search",
+    "query_weather": "查实时天气（今天/明天、气温、降雨、空气）；问天气就用它，不要拿它去搜网页",
+    "query_time": "查当前时间、日期、星期；别凭记忆答“现在几点”",
+    "image_search": "按关键词在网上搜真实图片并发给用户（立绘、壁纸、头像、摄影）；要 X/推文配图用 x_image_search，要某个网页里的图用 page_image",
+    "x_image_search": "在 X（推特）按关键词搜带图推文并发图；只在用户点名推特/X/推文/帖子正文时用，keyword 不写“真人”",
+    "page_image": "抓取用户给的网页或推文链接里的图片并发出去；需要先搜索再发图时用 image_search 或 x_image_search",
+    "send_sticker": "发达妮娅自己的表情包（本地立绘库）；网图用 image_search，两者别混",
+    "send_message": "用本机 QQ 给指定好友或群发一条文字消息；发图片用 image_search / page_image",
+    "open_app": "在本机打开应用、网站或文件；只是聊到某个应用时不要调",
+    "list_dir": "看文件夹里有哪些文件；要看文件内容用 read_file",
+    "read_file": "读一个文本文件的内容；只想知道有哪些文件用 list_dir",
+    "write_file": "新建或追加一个文本文件；只是让“记住某件事”用 remember",
+    "organize_folder": "把文件夹里的文件按类型归类到子文件夹",
+    "remember": "长期记住用户明确要求记住的事；写文件用 write_file",
+    "set_reminder": "定时提醒：X 分钟后，或写明具体时间提醒某件事",
+    "set_volume": "调节系统音量：静音、加减、指定百分比",
+    "set_brightness": "调节屏幕亮度",
+    "read_clipboard": "读取用户剪贴板里的文字",
+    "write_clipboard": "把文字写进用户剪贴板",
+    "system_sense": "查看本机推理后端、磁盘、提醒等系统状态；问本机情况时用它",
+    "model_detect": "列出本地 models 目录里可用的模型",
+    "screen_context": "截屏看用户当前屏幕；用户说“看看我的屏幕/这个页面”时用",
+    "bilibili_feed": "看 B 站指定 UP 主最近的投稿动态",
+    "run_python": "执行一段 Python 代码或现成脚本（计算、验证、跑 Skill 里的脚本）",
+    "list_skills": "列出本地已装的技能包（方法库）；先列再 load_skill",
+    "load_skill": "读出某个技能包的完整做法并照着执行，不要只把内容念给用户",
+    "read_skill_file": "读技能包里的附属文件（SKILL.md 里写“详见 xxx”时用）",
+    "login_site": "打开可见窗口让用户手动登录某网站；登录态只存在达妮娅自己的浏览器里，用户在自己浏览器登录不算数",
+    "ui_inspect": "查看某个窗口里有哪些可操作控件；点任何东西之前先用它看清再点",
+    "ui_click": "点击窗口里的某个控件；点之前先用 ui_inspect 确认控件名",
+    "ui_type": "往窗口输入框里打字（支持中文）",
+    "ui_hotkey": "发送快捷键组合（如 ctrl+s）",
+    "ui_window": "激活、切换、最小化、最大化、关闭窗口",
+    "list_books": "看书架（D:\\denia_terminal\\books）上有哪些书；问“有哪些书/能读什么”时用",
+    "feed_book": "把书架上的书拆成可分批阅读的块；用户说“读一下 XX/拆一下 XX”时先调它，之后才能 read_book_chunk",
+    "read_book_chunk": "读某本书的第 N 块正文；必须先 feed_book，按块号顺序读",
+    "continue_reading": "从上次读到的地方接着往下读；用户说“接着读/继续读”时用，不传 slug 自动选在读的那本",
+    "note_book_chunk": "读完一块后立刻把要点记成笔记；不调用就等于没读，之后想不起来",
+    "read_book_notes": "翻看已整理的读书笔记；用户说“看看笔记/翻翻笔记/回顾一下”时用，不要凭空回忆书里细节",
+}
+
+
+def _short_desc(text: str, limit: int = 110) -> str:
+    t = (text or "").strip().replace("\n", " ")
+    head = re.split(r"[。]", t)[0].strip()
+    return (head or t)[:limit]
 
 
 _TOOL_CALL_RE = re.compile(
@@ -449,13 +631,16 @@ def tool_manifest(limit: int = 0) -> str:
     limit: 0=全部；>0 时按注册顺序取前 N 个（配合 harness.max_tools）。
     每行一个：TOOL: 名称 —— 描述
     """
+    _key = ("manifest", _REG_VERSION, limit if limit and limit > 0 else 0)
+    _hit = _MANIFEST_CACHE.get(_key)
+    if _hit is not None:
+        return _hit
     tools = list(_TOOLS.values())
     if limit and limit > 0:
         tools = tools[:limit]
-    lines = []
-    for t in tools:
-        lines.append(f"TOOL: {t.name} —— {t.description}")
-    return "\n".join(lines)
+    _out = "\n".join(f"TOOL: {t.name} —— {t.description}" for t in tools)
+    _MANIFEST_CACHE[_key] = _out
+    return _out
 
 
 def list_tools() -> list:

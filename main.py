@@ -178,7 +178,8 @@ class TerminalApp(QObject):
         if not os.path.exists(tray_path):
             print(f"[托盘] 图标文件缺失: {tray_path}")
             return
-        self.app.setWindowIcon(QIcon(tray_path))
+        self.app.setWindowIcon(QIcon(os.path.join(ASSETS_DIR, "dania.ico")) if os.path.exists(
+            os.path.join(ASSETS_DIR, "dania.ico")) else QIcon(tray_path))
         self.tray = QSystemTrayIcon(QIcon(tray_path), self.app)
         self.tray.setToolTip("达妮娅终端")
         menu = QMenu()
@@ -219,8 +220,13 @@ class TerminalApp(QObject):
             c.stream_delta.connect(b.chat_delta.emit)
             c.stream_stall.connect(b.chat_stall.emit)
             c.stream_clear.connect(b.chat_clear.emit)
+            c.voice_rhythm.connect(b.voice_rhythm.emit)
+            c.voice_segment.connect(b.voice_segment.emit)
+            c.voice_stream_end.connect(b.voice_stream_end.emit)
+            c.voice_replay_state.connect(b.voice_replay_state.emit)
             c.voice_partial.connect(b.chat_partial.emit)
             c.stream_finish.connect(b.chat_finished.emit)
+            c.reply_ready.connect(b.chat_final.emit)
             c.stream_thinking.connect(b.chat_thinking.emit)
             c.tool_event.connect(b.tool_event.emit)
             # c.log 已经连到 _on_log，由 _on_log 统一转发到 b.log，避免重复
@@ -245,27 +251,55 @@ class TerminalApp(QObject):
         win = self.console_window
         if win is None:
             return
-        imgs = []
-        for item in items or []:
-            src = str(item or "").strip()
+
+        import requests
+        from concurrent.futures import ThreadPoolExecutor
+
+        MAX_BYTES = 8 * 1024 * 1024
+        MIME_BY_EXT = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp",
+            "gif": "image/gif", "bmp": "image/bmp",
+        }
+
+        def _one(src):
+            src = str(src or "").strip()
             if not src:
-                continue
+                return None
             if src.lower().startswith(("http://", "https://")):
-                imgs.append({"src": src, "name": ""})
-                continue
+                # 远程图先落成 data URL：避开站点防盗链导致的裂图，复制也更方便
+                try:
+                    resp = requests.get(src, headers={
+                        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                       "Chrome/120.0 Safari/537.36"),
+                        "Referer": src.split("/", 3)[0] + "//" + src.split("/", 3)[2] + "/",
+                    }, timeout=8)
+                    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                    if (resp.ok and len(resp.content) <= MAX_BYTES
+                            and (ctype.startswith("image/")
+                                 or resp.content[:4] in (b"\xff\xd8\xff\xe0", b"\x89PNG"))):
+                        mime = ctype if ctype.startswith("image/") else "image/jpeg"
+                        b64 = base64.b64encode(resp.content).decode("ascii")
+                        return {"src": f"data:{mime};base64,{b64}", "name": ""}
+                except Exception:
+                    pass
+                return {"src": src, "name": ""}  # 下载失败仍给 URL 兜底
             try:
-                if not os.path.isfile(src) or os.path.getsize(src) > 8 * 1024 * 1024:
-                    continue
+                if not os.path.isfile(src) or os.path.getsize(src) > MAX_BYTES:
+                    return None
                 ext = os.path.splitext(src)[1].lower().lstrip(".") or "png"
-                mime = {
-                    "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp",
-                    "gif": "image/gif", "bmp": "image/bmp",
-                }.get(ext, "image/png")
+                mime = MIME_BY_EXT.get(ext, "image/png")
                 with open(src, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode("ascii")
-                imgs.append({"src": f"data:{mime};base64,{b64}", "name": os.path.basename(src)})
+                return {"src": f"data:{mime};base64,{b64}", "name": os.path.basename(src)}
             except Exception:
-                continue
+                return None
+
+        srcs = [s for s in (items or []) if str(s or "").strip()][:8]
+        if not srcs:
+            return
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            imgs = [x for x in pool.map(_one, srcs) if x]
         if not imgs:
             return
         try:
@@ -332,17 +366,25 @@ class TerminalApp(QObject):
     def get_tasks(self) -> list:
         tasks = []
         try:
-            import dania_tools
+            from skills import get_active_reminders
 
-            for r in getattr(dania_tools, "_active_reminders", []):
+            # idx 与 complete_reminder 的排序保持一致，供任务页勾选完成
+            for i, r in enumerate(get_active_reminders()):
                 tasks.append(
-                    {"text": r.get("content", ""), "done": False, "prio": "中"}
+                    {"idx": i, "text": r.get("content", ""), "done": False, "prio": "中"}
                 )
         except Exception:
             pass
-        if not tasks:
-            tasks.append({"text": "暂无提醒任务", "done": False, "prio": "低"})
         return tasks[:10]
+
+    def complete_task(self, index: int) -> bool:
+        """任务页勾选：取消对应提醒（定时器到点后不再播报）"""
+        try:
+            from skills import complete_reminder
+
+            return bool(complete_reminder(index))
+        except Exception:
+            return False
 
     def get_services(self) -> list:
         result = []
@@ -410,50 +452,52 @@ class TerminalApp(QObject):
         # 只走 agnes 云端一条路：模型只列云端，不再展示本地推理配置项
         model_name = self._settings.get("model_name", "agnes-3.0-flash")
         options = [
-            {"value": "agnes-3.0-flash", "label": "云端 agnes-3.0-flash"},
+            {"value": "agnes-3.0-flash", "label": "质量优先 · agnes-3.0-flash（推理强，首字 10~25s）"},
+            {"value": "agnes-2.5-flash", "label": "速度优先 · agnes-2.5-flash（首字 1~2s，复杂总结略浅）"},
         ]
         model_items: list = [
             {"label": "云端 API Key", "key": "cloud_api_key", "value": self._settings.get("cloud_api_key", ""), "type": "str", "placeholder": "sk-... 或其它 Bearer token"},
             {"label": "云端 Base URL", "key": "cloud_base_url", "value": self._settings.get("cloud_base_url", ""), "type": "str", "placeholder": "如 https://api.agnes-ai.cn/v1"},
         ]
-        model_items.append({"label": "提示：模型已锁定为云端 agnes（本地推理入口已下线），改配置后会自动重新初始化", "key": "_model_hint", "value": "", "type": "hint"})
+        model_items.append({"label": "提示：只在云端 agnes 之间切换，选完即写盘并自动重新初始化；换模型后下一次回复生效，无需重启", "key": "_model_hint", "value": "", "type": "hint"})
 
         return [
-            {"label": "角色形象", "key": "character", "value": "达妮娅", "type": "str"},
-            {"label": "默认缩放", "key": "scale", "value": "0.7x", "type": "str"},
-            {"label": "语音合成", "key": "tts", "value": "GPT-SoVITS", "type": "str"},
-            {
-                "label": "LLM 模型",
-                "key": "model_name",
-                "value": model_name,
-                "type": "model_select",
-                "options": options,
-            },
-            {
-                "label": "回复长度",
-                "key": "reply_len",
-                "value": "简短（1-2句）",
-                "type": "str",
-            },
-            *model_items,
+            {"label": "角色形象", "value": "达妮娅", "type": "readonly", "group": "身份"},
             {
                 "label": "B站 登录凭证（官号动态）",
                 "key": "bilibili_login",
                 "type": "action",
                 "button": "扫码登录",
                 "value": self._bili_state_text(),
+                "group": "身份",
             },
+            {"label": "默认缩放", "value": "0.7x", "type": "readonly", "group": "外观"},
+            {"label": "回复长度", "value": "简短（1-2句）", "type": "readonly", "group": "外观"},
+            {"label": "语音合成", "value": "GPT-SoVITS", "type": "readonly", "group": "语音"},
+            {
+                "label": "LLM 模型",
+                "key": "model_name",
+                "value": model_name,
+                "type": "model_select",
+                "options": options,
+                "group": "模型",
+            },
+            {**model_items[0], "group": "模型"},
+            {**model_items[1], "group": "模型"},
+            {**model_items[2], "group": "模型"},
             {
                 "label": "启用 NapCat（QQ 消息转发）",
                 "key": "napcat",
                 "value": self.napcat_enabled(),
                 "type": "bool",
+                "group": "运行",
             },
             {
                 "label": "启动时自动检测并补齐服务",
                 "key": "autostart",
                 "value": bool(self._settings.get("auto_start", True)),
                 "type": "bool",
+                "group": "运行",
             },
         ]
 
@@ -502,7 +546,8 @@ class TerminalApp(QObject):
         elif key == "model_name":
             # 切换 LLM 模型：写 settings.json + 后台重新初始化
             self._save_settings({"model_name": value})
-            label_map = {"qwen2.5:3b": "本地 qwen2.5:3b", "agnes-3.0-flash": "云端 agnes-3.0-flash"}
+            label_map = {"agnes-3.0-flash": "质量优先 agnes-3.0-flash",
+                         "agnes-2.5-flash": "速度优先 agnes-2.5-flash"}
             label = label_map.get(value)
             if label is None:
                 label = f"云端 {value}" if (value.startswith("agnes") or value.startswith("cloud:")) else f"本地 {value}"
@@ -539,23 +584,6 @@ class TerminalApp(QObject):
         """控制台打开时拉取打开前的日志（JSON 数组字符串）"""
         try:
             return json.dumps(list(self._log_buffer), ensure_ascii=False)
-        except Exception:
-            return "[]"
-
-    def get_recent_traces(self) -> str:
-        """控制台「最近对话」：读 bot/data/qq_trace.jsonl 末尾 30 轮"""
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "bot", "data", "qq_trace.jsonl")
-        try:
-            with open(path, encoding="utf-8") as f:
-                lines = f.readlines()[-30:]
-            rows = []
-            for ln in lines:
-                try:
-                    rows.append(json.loads(ln))
-                except Exception:
-                    continue
-            return json.dumps(rows, ensure_ascii=False)
         except Exception:
             return "[]"
 
@@ -727,6 +755,11 @@ class TerminalApp(QObject):
             return
         active = self.app.activeWindow()
         console = self.console_window
+        # 有模态对话框（点图片按钮弹出的选文件窗口、确认框）时，activeWindow 会变成
+        # 对话框，控制台看起来"失顶层"，但用户其实还在操作终端 → 不算切走，
+        # 否则选图超过 5 秒就会被中途收成悬浮小人
+        if QApplication.activeModalWidget() is not None:
+            return
         # 控制台当前可见，且用户切走了 → 收小人
         if console and console.isVisible() and active is not console:
             self._on_log("🐾 终端不在顶层，自动收小人")
@@ -768,8 +801,7 @@ class TerminalApp(QObject):
         # 自动检测服务
         QTimer.singleShot(1500, self._auto_detect_services)
 
-        # 启动后按需自动连 WARP（x.com 直连不通且 WARP 可用时）
-        QTimer.singleShot(6000, self._auto_warp)
+        # 启动后不再自动连 WARP：只有搜 X 图时才按需连（见 x_image_search）
 
         # 启动后校验 B站 登录凭证，失效则提示重新扫码
         QTimer.singleShot(8000, self._check_bili_cookie)
@@ -808,24 +840,6 @@ class TerminalApp(QObject):
                 print(f"[B站校验] {exc}")
 
         threading.Thread(target=work, name="bili-cookie-check", daemon=True).start()
-
-    def _auto_warp(self):
-        """后台线程探测外网并在需要时连 WARP，不阻塞界面"""
-        import threading
-
-        def work():
-            try:
-                import warp_control
-                result = warp_control.maybe_auto_connect()
-                print(f"[WARP] 启动检查结果: {result}")
-                if result == "connected" and self.console_window is not None:
-                    data = warp_control.status()
-                    self.console_window.bridge.warp_updated.emit(
-                        json.dumps(data, ensure_ascii=False))
-            except Exception as e:
-                print(f"[WARP] 自动连接检查失败: {e}")
-
-        threading.Thread(target=work, name="warp-auto", daemon=True).start()
 
     def _lazy_init(self):
         self._on_log("🤖 正在初始化达妮娅...")

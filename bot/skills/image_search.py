@@ -26,6 +26,10 @@ def _extract_query(text: str) -> str:
     raw = m.group(1).strip() if m else text.strip()
     # 「X的图/X的图片」这类先整体削掉后缀，避免关键词变成「腿图」
     raw = re.sub(r"的(?:图片|照片|相片|图)$", "", raw).strip()
+    # 「真人」是筛选条件，不是搜索词：正常图文不会写「真人腿」，带着它反而搜不到
+    _stripped = re.sub(r"(?:真人照片|真人的照片|真人图|真人)", "", raw).strip()
+    if _stripped:
+        raw = _stripped
     # 去掉标点、语气词
     raw = re.sub(r"[？?！!。，,的]", "", raw).strip()
     # 去掉尾部的「图片/照片/相片」
@@ -84,17 +88,51 @@ def image_search(query: str) -> str:
     if not keyword:
         return "（没有有效的搜索关键词呢，告诉我要找什么图？）"
 
+    # 真人筛选：用户点名「真人/实拍」，或主题本身就是实拍类（腿、cos、美女…）
+    # 复用 X 搜图那套判定，避免把插画、动漫封面当成用户要的图发出去
+    from skills.x_image_search import _vision_probe, _face_score, _REAL_HINT, _REAL_TOPICS
+    want_real = bool(_REAL_HINT.search(text) or _REAL_TOPICS.search(keyword))
+
     dl = _get_downloader()
-    results = dl.search_bilibili_images(keyword, max_results=count)
+    # 需要筛真人时多抓一批候选：插画会被剔掉，留出余量才凑得够数量
+    fetch_n = min(max(count * 4, count), 15) if want_real else count
+    results = dl.search_bilibili_images(keyword, max_results=fetch_n)
     if not results:
-        # 搜索未命中任何来源（B站/百度都空）→ 明确失败
-        return f"（在 B 站和百度都没搜到「{keyword}」的图片呢，换个更具体的词试试？）"
+        # 搜索未命中任何来源（Bing/B站/百度都空）→ 明确失败
+        return f"（哪里都没搜到「{keyword}」的图片呢，换个更具体的词试试？）"
 
     urls = []
-    for r in results[:count]:
+    _seen = set()
+    for r in results:
         u = r.get("url") or r.get("cover")
-        if u:
+        # 同一个 URL 只发一次：搜索源经常把同一张封面重复返回
+        if u and u not in _seen:
+            _seen.add(u)
             urls.append(u)
+        if len(urls) >= fetch_n:
+            break
+
+    if want_real and urls:
+        from concurrent.futures import ThreadPoolExecutor
+
+        # 先并发落到本地，再让视觉模型判断是不是真人实拍
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            paths = [p for p in ex.map(lambda u: dl.download_image(u, keyword=keyword), urls) if p]
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            verdicts = list(ex.map(_vision_probe, paths))
+        if any(v is not None for v in verdicts):
+            kept = [p for p, v in zip(paths, verdicts)
+                    if v is True or (v is None and _face_score(p) > 0)]
+            dropped = len(paths) - len(kept)
+            if not kept:
+                return (f"（搜到 {len(paths)} 张「{keyword}」，但一张像真人实拍的都没有……"
+                        "换个更具体的词我再试试？）")
+            urls = kept
+            print(f"[真人筛选] 保留 {len(kept)} 张，剔掉 {dropped} 张插画/非真人")
+        else:
+            # 视觉模型不可用：放着不筛，好过把真图也全丢掉
+            urls = paths
+        urls = urls[:count]
 
     # QQ 会话里直接把链接交给 NapCat 发（它自己下载），本地不落盘
     try:

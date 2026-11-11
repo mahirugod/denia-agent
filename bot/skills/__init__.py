@@ -220,6 +220,15 @@ def get_active_reminders() -> list:
         return []
 
 
+def complete_reminder(index: int) -> bool:
+    try:
+        from importlib import import_module
+        m = import_module("reminder")
+        return bool(m.complete_reminder(index))
+    except Exception:
+        return False
+
+
 def fire_reminder_for_test(content: str):
     try:
         from importlib import import_module

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QVBoxLayout,
+    QWidget,
 )
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -33,6 +34,8 @@ class BiliLoginDialog(QDialog):
     logged_in = Signal(str, str)
 
     def __init__(self, parent=None, storage_dir: str = ""):
+        # 传入的 parent 可能不是 QWidget（或已销毁），一律按无父窗口处理，避免构造直接失败
+        parent = parent if isinstance(parent, QWidget) else None
         super().__init__(parent)
         self.setWindowTitle("B站 扫码登录")
         self.resize(540, 720)

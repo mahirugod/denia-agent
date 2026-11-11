@@ -3,7 +3,8 @@
 """
 技能包：browse_url
 达妮娅自己访问网页/图片/视频链接，读取内容后用人设回答。
-底层依赖 web_search.crawl_page（Playwright）+ media_downloader.MediaDownloader。
+底层依赖 Scrapling Fetcher（静态页快路径）+ web_search.crawl_page（Playwright 兜底）
++ media_downloader.MediaDownloader。
 
 链接识别：
   - 图片直链（.jpg/.png/.webp/.gif/.bmp）→ 下载 → 喂视觉模型
@@ -37,6 +38,11 @@ _BILIBILI_BV_RE = re.compile(r"BV[0-9A-Za-z]+")
 _VIDEO_EXT_RE = re.compile(
     r"\.(mp4|avi|mov|mkv|webm|flv|wmv|mpg)(\?|#|$)", re.IGNORECASE
 )
+
+# 快路径认正文的下限：低于这个长度基本是「只剩标题/导航」的 JS 空壳。
+# 阈值太高会误杀短公告页（一页就一百来字），和持久化会话的 120 字门槛对齐
+_QUICK_MIN = 120
+_SILENCED = [False]  # Scrapling 每次请求都打 INFO 日志，第一次用的时候关掉
 
 
 def _extract_url(query: str) -> str:
@@ -202,17 +208,93 @@ def _handle_video_link(url: str, prompt: str) -> str:
         return f"（视频下载出错：{_e}）"
 
 
-def _handle_web_page(url: str, prompt: str) -> str:
-    """普通网页：先无痕抓取，遇到登录墙/空壳再用持久化会话重试"""
-    # 登录窗口还开着时浏览器线程被独占，此时抓取会白等到超时，直接说清楚
-    if _LOGIN_STATE["running"]:
-        return "（登录窗口还开着呢，等你登完把窗口关掉，我再去抓这个页面）"
-    text = ""
+_SHELL_MIN_LINES = 8      # 行数太少不判空壳（短页本来就只有两三段正文）
+_SHELL_MAX_AVG_LINE = 12  # 平均每行不足 12 字，基本是导航/菜单词条堆
+_JS_REQUIRED_RE = re.compile(
+    r"(?:启用|开启)\s*JavaScript|enable\s+JavaScript|JavaScript\s+(?:is\s+)?required",
+    re.IGNORECASE)
+
+
+def _looks_like_nav_shell(text: str) -> bool:
+    """快路径拿到的像导航/JS 空壳，而不是正文。
+
+    Fetcher 不执行 JS：正文由前端渲染的页面，服务端 HTML 里只剩菜单、链接、页脚。
+    这些短词条堆起来也能轻松过 120 字门槛，之前会被当成正文而跳过 Playwright。
+    导航页的典型形态是「很多行、每行几个字」；正文页每段（行）通常明显更长。
+    实测参考：qq.com 首页 1308 字/142 行（均值 9.2）判空壳，
+    python.org 关于页 4736 字/246 行（均值 19.3）判正文。
+    """
+    body = (text or "").strip()
+    if not body:
+        return True
+    # 只扫开头：正文里讨论到「enable JavaScript」不该被判成空壳
+    if _JS_REQUIRED_RE.search(body[:600]):
+        return True
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if len(lines) >= _SHELL_MIN_LINES:
+        avg = len(body) / len(lines)
+        if avg < _SHELL_MAX_AVG_LINE:
+            return True
+    return False
+
+
+def _quick_fetch(url: str, timeout: float = 12) -> str:
+    """静态页快路径：Scrapling Fetcher（带 TLS 指纹伪装）直接取正文。
+
+    Playwright 要申请独占的浏览器线程、启动一次几秒；静态页面用这个 0.1~0.2s 就够。
+    取不到像样的正文（JS 空壳、登录墙、4xx/5xx）就返回空串，交回原来的 Playwright 路径。
+    """
     try:
-        from web_search import crawl_page
-        text = (crawl_page(url) or "").strip()
-    except Exception as e:
-        print(f"[browse_url] 无痕抓取失败: {e}")
+        from scrapling.fetchers import Fetcher
+    except Exception as _e:
+        print(f"[browse_url] Scrapling 不可用（走 Playwright）: {_e}")
+        return ""
+    if not _SILENCED[0]:
+        _SILENCED[0] = True
+        try:
+            import logging
+            logging.getLogger("scrapling").setLevel(logging.ERROR)
+        except Exception:
+            pass
+    # 代理环境必须带上代理：否则快路径会先直连等满 timeout 才转 Playwright
+    try:
+        from browser_session import _proxy_server
+        proxy = _proxy_server()
+    except Exception:
+        proxy = ""
+    try:
+        kwargs = {"timeout": timeout, "follow_redirects": True, "stealthy_headers": True}
+        if proxy:
+            kwargs["proxy"] = proxy
+        page = Fetcher.get(url, **kwargs)
+        if getattr(page, "status", 0) >= 400:
+            return ""
+        text = (page.get_all_text() or "").strip()
+        # 只剩标题/导航的（JS 空壳）或登录墙，都不算拿到正文
+        if len(text) < _QUICK_MIN or _looks_like_login_page(url, text):
+            return ""
+        if _looks_like_nav_shell(text):
+            print(f"[browse_url] 快路径只拿到导航/空壳（{len(text)} 字），转 Playwright")
+            return ""
+        return text
+    except Exception as _e:
+        print(f"[browse_url] 快路径失败（转 Playwright）: {str(_e)[:80]}")
+        return ""
+
+
+def _handle_web_page(url: str, prompt: str) -> str:
+    """普通网页：HTTP 快路径 → 无痕 Playwright → 带登录态的持久化会话"""
+    # 静态页先走 HTTP：不占浏览器线程，登录窗口开着也能抓
+    text = _quick_fetch(url)
+    # Playwright 阶段登录窗口还开着的话浏览器线程被独占，会白等到超时，直接说清楚
+    if not text and _LOGIN_STATE["running"]:
+        return "（登录窗口还开着呢，等你登完把窗口关掉，我再去抓这个页面）"
+    if not text:
+        try:
+            from web_search import crawl_page
+            text = (crawl_page(url) or "").strip()
+        except Exception as e:
+            print(f"[browse_url] 无痕抓取失败: {e}")
 
     # 空壳或登录墙 → 用带登录态的持久化会话重试（访客无权借用主人的登录态）
     need_session = (not text) or len(text) < 120

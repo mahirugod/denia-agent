@@ -24,12 +24,13 @@ ISOLATED_TOOLS = {
     "web_search",
     "query_weather",
     "query_time",
-    "image_search",
     "bilibili_feed",
     "model_detect",
     "read_clipboard",
     "write_clipboard",
 }
+# image_search 不能隔离：它要把图片交给 qq_outbox / 控制台出口，
+# 这两个出口的会话上下文（线程内的 chat、local_sink）只在主进程里，子进程里 queue 永远失败
 
 _TIMEOUTS = {"web_search": 90.0, "bilibili_feed": 45.0, "image_search": 60.0}
 _DEFAULT_TIMEOUT = 60.0
@@ -64,6 +65,10 @@ class _Worker:
     # ── 生命周期 ──
     def _spawn(self):
         self.q = queue.Queue()
+        # 子进程也强制 UTF-8：Windows 默认代码页是 GBK，只给父进程指定 encoding
+        # 不够，子进程写出的中文仍会变成乱码
+        _env = dict(os.environ)
+        _env["PYTHONIOENCODING"] = "utf-8"
         self.proc = subprocess.Popen(
             [sys.executable, WORKER],
             cwd=BOT_DIR,
@@ -74,6 +79,7 @@ class _Worker:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=_env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         threading.Thread(target=self._reader, args=(self.proc, self.q),

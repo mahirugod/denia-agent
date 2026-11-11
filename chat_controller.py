@@ -44,12 +44,23 @@ def _clean_display_text(text: str, for_tts: bool = False) -> str:
     # 标记被截断（没有完整 JSON）→ 丢掉从标记到第一个汉字之间的内容
     text = re.sub(r"(?is)^\s*[A-Z]{0,6}OL\s*[:：].*?(?=[\u4e00-\u9fff])", "", text)
     # 流式末尾可能有不完整的标签（如 [情绪:i），一并去掉
-    text = re.sub(r"\[情绪:[^\]]*\Z", "", text)
+    text = re.sub(r"\[情绪[：:][^\]]*\Z", "", text)
     text = re.sub(r"\[@[^\]]*\Z", "", text)
     # 清理 TOOL: 工具标记（模型自报工具时不应显示给用户）
     text = re.sub(r"(?m)^TOOL[:：].*$\n?", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\bTOOL[:：]\s*\w+(?:\s*ARGS[:：]\s*\{.*?\})?", "", text)
+    text = re.sub(r"(?<![A-Za-z])TOOL[:：]\s*\w*(?:\s*ARGS[:：]\s*\{.*?\})?", "", text)
     text = re.sub(r"\bTOO?L?\b", "", text)
+    # 工具参数残片（TOOL:/ARGS: 标记被流式截断后行首只剩 query":"梁文峰是谁"}）
+    _arg_key = (
+        r"query|keyword|keywords|url|path|name|slug|count|city|text|q|"
+        r"page|limit|group_id|user_id|code|command|args|arguments")
+    _arg_pair = (r'["\']?(?:%s)["\']?\s*[:：]\s*(?:"[^"\n]*"|[^,，\s}\n]{0,60})'
+                 % _arg_key)
+    text = re.sub(
+        r'(?is)^\s*[{\[]?\s*' + _arg_pair +
+        r'(?:\s*[,，]\s*' + _arg_pair + r')*\s*[}\]]?[，,。;；、]?\s*',
+        "", text,
+    )
     # 纯标点/省略号/空白片段（TTS 跳过；显示时保留，标点常单独成一个 token）
     if for_tts:
         stripped = re.sub(r"[，。、！？；：…~～\s]", "", text)
@@ -67,6 +78,10 @@ class ChatController(QObject):
     stream_delta = Signal(str)
     stream_stall = Signal(str)  # 首字迟迟未到：先占位回应（不进打字机队列）
     stream_clear = Signal()  # 真实内容到达：清掉占位文字
+    voice_rhythm = Signal(float)  # 每字毫秒（按当前句音频时长/字数算出），前端打字机跟着语速走
+    voice_segment = Signal(str, float)  # 本段显示文本 + 音频时长ms：前端按段内时钟揭示文字
+    voice_stream_end = Signal()         # 本轮语音全部播完（含被打断/合成失败）
+    voice_replay_state = Signal(bool)  # 气泡语音重播：True=开始播放，False=结束/被打断
     stream_finish = Signal(str)  # 纯完成通知；参数为错误提示（成功时为空串）
     stream_thinking = Signal(str)  # 思考链增量（reasoning_content，不进打字机，进折叠区）
     reply_ready = Signal(str)  # 完整回复文本（清洗后）
@@ -90,6 +105,8 @@ class ChatController(QObject):
         self._last_user_activity = time.time()
         self._last_proactive_ts = 0.0
         self._proactive_used = deque(maxlen=4)
+        self._proactive_miss = 0      # 连续几次主动搭话没被回应
+        self._proactive_mark = 0.0    # 上次重置时的用户活动时间
         self._stream_active = False
         # 消息串行队列：连发多条时严格按顺序逐条处理，避免前一条回复被后一条顶掉
         self._msg_queue = queue.Queue()
@@ -110,6 +127,10 @@ class ChatController(QObject):
         self._typing_done_event = threading.Event()
         self._stream_seg_q = None
         self._stream_had_text = False
+        # 流式（增量）播放：按上一段实测语速估算本段时长，驱动前端逐字揭示
+        self._tts_ms_per_char = 220.0
+        self._active_stream = None   # sounddevice 输出流（打断时立即 abort）
+        self._stream_voice_flag = None  # 是否支持流式合成/增量播放（首次会话探测后缓存）
 
         # 气泡首字与首句语音同步：语音未出声前先缓冲文字增量
         self._delta_lock = threading.Lock()
@@ -117,6 +138,13 @@ class ChatController(QObject):
         self._delta_released = True
         self._stream_session = 0
         self._first_audio = threading.Event()
+
+        # 播出文本语义：本轮真正写进声卡的文字（被打断时按它截断历史）
+        self._voice_spoken_sid = 0
+        self._voice_spoken_text = ""
+        self._voice_incomplete = False  # 播放线程是否提前退出（打断/设备故障）
+        self._turn_reply = ""           # 本轮 LLM 完整回复（截断时用于定位历史条目）
+        self._turn_reply_sid = 0
 
         # VAD 打断监听（说话自动停播）——默认关闭，避免误触发
         self._vad_enabled = False
@@ -302,6 +330,9 @@ class ChatController(QObject):
                     cfg[k.replace("proactive_", "")] = s[k]
             cfg["dnd_start"] = s.get("proactive_dnd_start", cfg["dnd_start"])
             cfg["dnd_end"] = s.get("proactive_dnd_end", cfg["dnd_end"])
+            # 单独的开合开关（不在上面按前缀批量映射，免得键名对不上）
+            cfg["backoff"] = bool(s.get("proactive_backoff_enabled", True))
+            cfg["hooks"] = bool(s.get("proactive_hooks_enabled", True))
         except Exception:
             pass
         return cfg
@@ -332,15 +363,32 @@ class ChatController(QObject):
             now = time.time()
             if now - self._last_user_activity < float(c["idle_min"]) * 60:
                 return
+            if self._last_user_activity > float(getattr(self, "_proactive_mark", 0.0)):
+                self._proactive_mark = self._last_user_activity
+                self._proactive_miss = 0
+            _miss = int(getattr(self, "_proactive_miss", 0))
             if self._last_proactive_ts:
                 gap = now - self._last_proactive_ts
-                if gap < float(c["interval_min"]) * 60 or gap < float(c["cooldown_min"]) * 60:
+                # 连续几次没人理，就逐步拉长间隔，别越冷场越起劲（可用开关关掉）
+                _factor = (2 ** min(_miss, 3)) if c.get("backoff", True) else 1
+                need = float(c["interval_min"]) * 60 * _factor
+                if gap < need or gap < float(c["cooldown_min"]) * 60:
                     return
             if self._in_dnd():
                 return
             if self._voice_thread is not None and self._voice_thread.is_alive():
                 return
+            # 心情很差时不主动搭话。必须在消耗自思考话头/调 API 之前拦住，
+            # 否则想法被吃掉、还白花一次生成（软下限，用户问的事照样会答）
+            try:
+                _m = float(getattr(
+                    getattr(getattr(self, "_bot", None), "llm", None), "_mood", 0.0) or 0.0)
+                if _m <= -6:
+                    return
+            except Exception:
+                pass
             self._last_proactive_ts = now
+            self._proactive_miss = _miss + 1
             self._stream_active = True
             threading.Thread(target=self._proactive_locked, args=(None,), daemon=True).start()
         except Exception as e:
@@ -353,7 +401,9 @@ class ChatController(QObject):
             try:
                 llm = getattr(getattr(self, "_bot", None), "llm", None)
                 if llm is not None and hasattr(llm, "generate_proactive"):
-                    text = llm.generate_proactive(hint=self._proactive_hint()) or ""
+                    hist = list(getattr(llm, "conversation_history", []) or [])[-6:]
+                    text = llm.generate_proactive(
+                        hint=self._proactive_hint(), history=hist) or ""
             except Exception as e:
                 self.log.emit(f"⚠️ 主动话题生成失败，用固定台词: {e}")
             self._proactive_worker(text or fallback or self._pick_proactive())
@@ -372,10 +422,21 @@ class ChatController(QObject):
         else:
             slot = "深夜"
         hint = f"现在是{slot}。"
+        llm = getattr(getattr(self, "_bot", None), "llm", None)
         try:
-            mood = getattr(getattr(self, "_bot", None), "llm", None)
-            if mood is not None and hasattr(mood, "_mood_label"):
-                hint += f"你现在的心情：{mood._mood_label()}。"
+            if llm is not None and hasattr(llm, "_mood_label"):
+                hint += f"你现在的心情：{llm._mood_label()}。"
+            # 空闲时自己冒出来的想法优先：从这里开口，比固定台词更像"她自己在想事"
+            thought = ""
+            if llm is not None and hasattr(llm, "take_proactive_thought"):
+                thought = llm.take_proactive_thought()
+            if thought:
+                hint += f"\n你刚才闲着的时候一直在想：{thought}。就用这个念头自然开个口，别把它念出来。"
+            if (self._proactive_cfg.get("hooks", True)
+                    and llm is not None and hasattr(llm, "take_proactive_hook")):
+                hook = llm.take_proactive_hook()
+                if hook:
+                    hint += f"\n可接的话头（用户之前说过这句）：{hook}"
         except Exception:
             pass
         return hint
@@ -440,7 +501,19 @@ class ChatController(QObject):
         return line
 
     def _proactive_worker(self, text: str):
-        """像普通回复一样显示气泡并播报，但不写入对话历史"""
+        """像普通回复一样显示气泡并播报；这句话要记进历史，用户接下来的短答才有参照"""
+        try:
+            _m = float(getattr(getattr(getattr(self, "_bot", None), "llm", None), "_mood", 0.0) or 0.0)
+            if _m <= -6:
+                return  # 心情很差时不主动搭话；用户问的事照样会答（软下限）
+        except Exception:
+            pass
+        try:
+            _llm = getattr(getattr(self, "_bot", None), "llm", None)
+            if _llm is not None and hasattr(_llm, "update_history") and text:
+                _llm.update_history("assistant", text)
+        except Exception:
+            pass
         try:
             self._stream_had_text = False
             self._typing_done_event = threading.Event()
@@ -449,6 +522,9 @@ class ChatController(QObject):
                 _sid = self._stream_session
                 self._delta_buffer = []
                 self._delta_released = True
+            # 主动话题也按播出文本记历史：被打断时同样截断到真正播出的部分
+            self._turn_reply = text
+            self._turn_reply_sid = _sid
             self._prefix_buf = ""
             self._prefix_ready = False
             self._first_audio = threading.Event()
@@ -620,6 +696,8 @@ class ChatController(QObject):
                             text,
                             on_sentence=lambda seg: seg_q.put(seg),
                             on_delta=self._emit_delta,
+                            # 被打断时按"真正播出"的部分写历史，而不是整段回复
+                            spoken_provider=lambda _s=_sid: self._spoken_snapshot(_s),
                         )
                         break  # 成功则跳出重试
                     except Exception as e:
@@ -685,6 +763,10 @@ class ChatController(QObject):
                     _thinking = getattr(self._bot.llm, "last_thinking", "")
                 if _thinking:
                     self.stream_thinking.emit(_thinking)
+
+            # 记录本轮完整回复 + 所属会话：播放线程打断时据此定位历史条目
+            self._turn_reply = reply or ""
+            self._turn_reply_sid = _sid
 
             if reply:
                 clean = _clean_display_text(reply)
@@ -756,14 +838,27 @@ class ChatController(QObject):
         self._voice_interrupt = interrupt
         self._typing_done_event = threading.Event()
         session_done = threading.Event()
-        ready_q = queue.Queue(maxsize=3)
+        if self._stream_voice_capable():
+            # 增量播放：队列里是 PCM 分片（约 5 秒缓冲），合成线程只负责收流，
+            # 播放线程按段写声卡；两线程解耦后下句请求能在上句播放时就开始
+            ready_q = queue.Queue(maxsize=80)
+            synth_target = self._voice_synth_worker_stream
+            player_target = self._voice_stream_player_stream
+        else:
+            ready_q = queue.Queue(maxsize=3)
+            synth_target = self._voice_synth_worker
+            player_target = self._voice_stream_player
         self._stream_ready_q = ready_q
         _sid = self._stream_session
+        # 新一轮语音：清空上一轮的播出文本快照
+        self._voice_spoken_sid = _sid
+        self._voice_spoken_text = ""
+        self._voice_incomplete = False
         self._voice_synth_thread = threading.Thread(
-            target=self._voice_synth_worker, args=(ready_q, interrupt), daemon=True
+            target=synth_target, args=(ready_q, interrupt), daemon=True
         )
         self._voice_thread = threading.Thread(
-            target=self._voice_stream_player,
+            target=player_target,
             args=(ready_q, interrupt, self._typing_done_event, session_done, _sid),
             daemon=True,
         )
@@ -771,6 +866,27 @@ class ChatController(QObject):
         self._voice_thread.start()
         # VAD 打断监听：说话自动停播
         self._start_vad_monitor(interrupt, session_done)
+
+    def _stream_voice_capable(self) -> bool:
+        """探测增量播放能力：sounddevice/numpy 可用且合成器支持流式。
+
+        首次探测后缓存；不可用时整段合成 + winsound 播放（旧链路）兜底。
+        """
+        if self._stream_voice_flag is not None:
+            return self._stream_voice_flag
+        ok = False
+        try:
+            import sounddevice  # noqa: F401
+            import numpy  # noqa: F401
+
+            ok = self._voice_synth is not None and hasattr(
+                self._voice_synth, "synthesize_stream")
+        except Exception as e:
+            self.log.emit(f"⚠️ 增量播放不可用，回落整段播放: {str(e)[:60]}")
+        self._stream_voice_flag = bool(ok)
+        if self._stream_voice_flag:
+            self.log.emit("🔊 语音增量播放已启用")
+        return self._stream_voice_flag
 
     def _start_vad_monitor(self, interrupt, session_done):
         if not getattr(self, "_vad_enabled", True) or self._mic_active:
@@ -884,10 +1000,72 @@ class ChatController(QObject):
             winsound.PlaySound(None, winsound.SND_PURGE)
         except Exception:
             pass
+        # 增量播放：立即中止声卡输出流，避免打断后还在吐缓冲帧
+        st = getattr(self, "_active_stream", None)
+        if st is not None:
+            try:
+                st.abort()
+            except Exception:
+                pass
         for attr in ("_voice_synth_thread", "_voice_thread"):
             t = getattr(self, attr, None)
             if t is not None and t.is_alive():
                 t.join(timeout=2)
+
+    @staticmethod
+    def _prefix_by_chars(text: str, n: int) -> str:
+        """取前 n 个有效字（不含标点/空白）的原始前缀，用于截断未播完的句子。"""
+        if n <= 0 or not text:
+            return ""
+        count = 0
+        for i, ch in enumerate(text):
+            if re.match(r"[\s，。、！？；：…~～,.\-!?;:()（）“”\"']", ch):
+                continue
+            count += 1
+            if count >= n:
+                return text[:i + 1]
+        return text
+
+    def _spoken_snapshot(self, sid):
+        """本轮已播出文字：None=未被打断（按全文记历史）；空串=一句都没播出。"""
+        if getattr(self, "_voice_spoken_sid", 0) != sid:
+            return None
+        if not getattr(self, "_voice_incomplete", False):
+            return None
+        return getattr(self, "_voice_spoken_text", "")
+
+    def _on_voice_turn_finished(self, sid, spoken, incomplete):
+        """语音轮次结束：被打断时把历史里那条完整回复截断成真正播出的部分。"""
+        if not incomplete:
+            return
+        if getattr(self, "_turn_reply_sid", 0) != sid:
+            return  # LLM 还没写完这轮（历史由 spoken_provider 在写盘时截断）
+        reply = getattr(self, "_turn_reply", "") or ""
+        if len(reply.strip()) < 2:
+            return
+        llm = getattr(getattr(self, "_bot", None), "llm", None)
+        if llm is None or not hasattr(llm, "truncate_last_assistant_reply"):
+            return
+        llm.truncate_last_assistant_reply(reply, spoken)
+
+    @staticmethod
+    def _split_first_tts_segment(text: str, min_head: int = 6):
+        """首句在第一个逗号/顿号处切一刀，先合成前半句尽快出声。
+
+        - 只对首句调用；head+tail 拼起来仍是原文，前端按段累计不会丢字
+        - 逗号前有效字不足 min_head（如"嗯，"）就换下一个逗号，避免只合成语气词
+        """
+        pos = 0
+        while True:
+            m = re.search(r"[，、]", text[pos:])
+            if m is None:
+                return None
+            end = pos + m.end()
+            head, tail = text[:end], text[end:]
+            if (len(re.sub(r"[\s，、。！？；：…]", "", head)) >= min_head
+                    and len(re.sub(r"\s", "", tail)) >= 2):
+                return head, tail
+            pos = end
 
     def _voice_synth_worker(self, ready_q, interrupt):
         """合成线程：取分句 → 后台预合成 → 就绪队列（与播放并行，消除句间空窗）"""
@@ -896,25 +1074,49 @@ class ChatController(QObject):
         if synth is None or seg_q is None:
             return
         idx = 0
+        _pending_pieces = []  # 首句切分后的剩余片段：前半句先出声，后半句边播边合成
+        _first_seg = True
         try:
             while True:
                 if interrupt.is_set():
                     break
-                try:
-                    seg = seg_q.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                if seg is None:
-                    break
-                clean_seg = _clean_display_text(seg, for_tts=True)
-                if not clean_seg.strip():
-                    continue
+                if _pending_pieces:
+                    clean_seg = _pending_pieces.pop(0)
+                else:
+                    try:
+                        seg = seg_q.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    if seg is None:
+                        break
+                    clean_seg = _clean_display_text(seg, for_tts=True)
+                    if not clean_seg.strip():
+                        continue
+                    if _first_seg:
+                        _first_seg = False
+                        _parts = self._split_first_tts_segment(clean_seg)
+                        if _parts:
+                            _pending_pieces = list(_parts)
+                            clean_seg = _pending_pieces.pop(0)
                 wav_path = os.path.join(
                     tempfile.gettempdir(),
                     f"dania_voice_{int(time.time() * 1000)}_{idx}.wav",
                 )
                 idx += 1
                 ok = synth.synthesize(clean_seg, wav_path)
+                # 质量兜底：时长/字数明显偏离正常语速（吞字或拖沓）就换随机种子重合成一次
+                if ok:
+                    try:
+                        import wave as _wq
+                        with _wq.open(wav_path, "rb") as _f:
+                            _dur = _f.getnframes() / float(_f.getframerate() or 1)
+                        _n = max(1, len(re.sub(r"[\s，。！？、…—\"“”]", "", clean_seg)))
+                        _per = _dur / _n
+                        if _per < 0.08 or _per > 0.45:
+                            self.log.emit(f"⚠️ 合成异常({_per:.2f}s/字)，重试一次")
+                            ok = synth.synthesize(clean_seg, wav_path)
+                    except Exception:
+                        pass
                 if interrupt.is_set():
                     # 已打断：丢弃刚合成的音频
                     try:
@@ -937,6 +1139,93 @@ class ChatController(QObject):
             except Exception:
                 pass
 
+    def _voice_synth_worker_stream(self, ready_q, interrupt):
+        """流式合成线程：逐句收流，把 PCM 分片入队（不在这里播放）。
+
+        收到头块就入队 "seg"，之后每收一块入队 "pcm"；
+        播放线程消费的阻塞会形成背压，同时下句请求可以在上句播放期间发起。
+        """
+        synth = self._voice_synth
+        seg_q = self._stream_seg_q
+        if synth is None or seg_q is None:
+            return
+        idx = 0
+        _pending_pieces = []  # 首句切分后的剩余片段
+        _first_seg = True
+
+        def _put(item):
+            while not interrupt.is_set():
+                try:
+                    ready_q.put(item, timeout=0.3)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        try:
+            while True:
+                if interrupt.is_set():
+                    break
+                if _pending_pieces:
+                    clean_seg = _pending_pieces.pop(0)
+                else:
+                    try:
+                        seg = seg_q.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    if seg is None:
+                        break
+                    clean_seg = _clean_display_text(seg, for_tts=True)
+                    if not clean_seg.strip():
+                        continue
+                    if _first_seg:
+                        _first_seg = False
+                        _parts = self._split_first_tts_segment(clean_seg)
+                        if _parts:
+                            _pending_pieces = list(_parts)
+                            clean_seg = _pending_pieces.pop(0)
+
+                wav_path = os.path.join(
+                    tempfile.gettempdir(),
+                    f"dania_voice_{int(time.time() * 1000)}_{idx}.wav",
+                )
+                _is_first = (idx == 0)  # 本轮第一段：允许引擎用 cut5 抢先出声
+                idx += 1
+
+                def _on_start(sr, ch, width, _seg=clean_seg, _path=wav_path):
+                    _put(("seg", _seg, _path, sr, ch, width))
+
+                def _on_frames(pcm):
+                    _put(("pcm", pcm))
+
+                # 不做整段质量重试：流式已经播出，重合成会造成重复/割裂
+                info = synth.synthesize_stream(
+                    clean_seg, wav_path,
+                    on_start=_on_start,
+                    on_frames=_on_frames,
+                    should_stop=interrupt.is_set,
+                    first=_is_first,
+                )
+                if not info:
+                    self.log.emit("⚠️ 一句合成失败，跳过")
+                    try:
+                        os.remove(wav_path)
+                    except OSError:
+                        pass
+                frames = info[3] if info else 0
+                _put(("eos", frames, clean_seg))
+                if interrupt.is_set():
+                    try:
+                        os.remove(wav_path)
+                    except OSError:
+                        pass
+                    break
+        finally:
+            try:
+                ready_q.put(None, timeout=2)
+            except Exception:
+                pass
+
     def _voice_stream_player(self, ready_q, interrupt, typing_done, session_done=None, sid=None):
         """播放线程：只播就绪音频，被打断时立即退出"""
         import winsound
@@ -944,6 +1233,11 @@ class ChatController(QObject):
         heard_first = False
         interrupted = False
         t0 = time.time()
+        spoken_parts = []  # 真正播完的段文本（被打断时据此截断历史）
+        saw_end = False    # 是否消费到队列哨兵（正常播完）
+        cur_seg = ""       # 当前正在播的段文本
+        cur_dur = 0.0      # 当前段的音频时长（秒）
+        cur_t0 = 0.0       # 当前段开始播放的时刻
         try:
             if ready_q is None:
                 return
@@ -956,6 +1250,7 @@ class ChatController(QObject):
                         break
                     continue
                 if item is None:
+                    saw_end = True
                     break
                 if interrupt.is_set():
                     self._discard_wav(item)
@@ -963,6 +1258,28 @@ class ChatController(QObject):
                     break
                 seg, wav_path = item
                 if wav_path and os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+                    # 打字机与语速同步：这句音频时长 ÷ 字数 = 每字毫秒，推给前端
+                    _seg_ms = 0.0  # 读时长失败时按 0 处理：前端整段直接显示，不用错值
+                    try:
+                        import wave as _wave
+                        with _wave.open(wav_path, "rb") as _w:
+                            _dur = _w.getnframes() / float(_w.getframerate() or 1)
+                        _seg_ms = max(0.0, _dur * 1000.0)
+                        _chars = len(re.sub(r"[\s，。！？、,.!?…；;:：\"“”]", "", seg or ""))
+                        if _dur > 0 and _chars >= 2:
+                            self.voice_rhythm.emit(
+                                max(40.0, min(400.0, _dur * 1000.0 / _chars)))
+                    except Exception:
+                        pass
+                    cur_seg = seg or ""
+                    cur_dur = _seg_ms / 1000.0
+                    # 段内时钟：在音频真正开播前把「本段文本 + 时长」推给前端，
+                    # 前端按这段的时长逐字揭示，段边界强制对齐，避免跨句累积漂移
+                    if sid is None or sid == self._stream_session:
+                        try:
+                            self.voice_segment.emit(seg, _seg_ms)
+                        except Exception:
+                            pass
                     if not heard_first:
                         heard_first = True
                         self.log.emit(f"🔊 首句出声 {time.time() - t0:.1f}s")
@@ -971,23 +1288,46 @@ class ChatController(QObject):
                             self._first_audio.set()
                         self._release_deltas(sid)
                         self.state_changed.emit("speaking")
+                    cur_t0 = time.time()
                     winsound.PlaySound(wav_path, winsound.SND_FILENAME)
                     try:
                         os.remove(wav_path)
                     except OSError:
                         pass
                     if interrupt.is_set():
+                        # winsound 被 SND_PURGE 中止：按已播时长占比估算播出字数
+                        _elapsed = max(0.0, time.time() - cur_t0)
+                        if cur_dur > 0 and cur_seg:
+                            _n = len(re.sub(r"[\s，。！？、,.!?…；;:：\"“”]", "", cur_seg))
+                            _frac = min(1.0, _elapsed / cur_dur)
+                            _part = self._prefix_by_chars(cur_seg, int(_n * _frac))
+                            if _part:
+                                spoken_parts.append(_part)
                         interrupted = True
                         break
+                    if cur_seg:
+                        spoken_parts.append(cur_seg)
+                    cur_seg = ""
                 else:
                     self.log.emit("⚠️ 一句合成失败，跳过")
         except Exception as e:
             self.log.emit(f"❌ 语音出错: {e}")
         finally:
+            # 播出文本快照：整段播完的 + 当前段已播出的部分
+            if ready_q is not None:
+                _sid_eff = sid if sid is not None else self._stream_session
+                self._voice_spoken_sid = _sid_eff
+                self._voice_spoken_text = "".join(spoken_parts)
+                self._voice_incomplete = not saw_end
+                self._on_voice_turn_finished(
+                    _sid_eff, self._voice_spoken_text, not saw_end)
             # 无论正常结束还是合成失败，都要放行被扣住的文字，避免气泡一直空着
             if sid is None or sid == self._stream_session:
                 self._first_audio.set()
             self._release_deltas(sid)
+            # 通知前端本轮语音结束：把没读到的尾巴（表情/代码等）补齐并定稿
+            if sid is None or sid == self._stream_session:
+                self.voice_stream_end.emit()
             # 清理未播放的预合成音频
             while ready_q is not None:
                 try:
@@ -1014,6 +1354,219 @@ class ChatController(QObject):
                     os.remove(item[1])
             except OSError:
                 pass
+
+    @staticmethod
+    def _discard_stream_item(item):
+        """丢弃队列里未消费的分片：流式 seg 删临时 wav，其它条目忽略/走旧逻辑"""
+        if not isinstance(item, tuple) or not item:
+            return
+        if item[0] == "seg":
+            try:
+                if len(item) >= 3 and item[2] and os.path.exists(item[2]):
+                    os.remove(item[2])
+            except OSError:
+                pass
+            return
+        if item[0] in ("pcm", "eos"):
+            return
+        ChatController._discard_wav(item)
+
+    @staticmethod
+    def _stream_write_pcm(stream, pcm, channels, interrupt):
+        """把一块裸 PCM 拆成小片写声卡：write 阻塞即自然限速，片间检查打断。"""
+        import numpy as np
+
+        if not pcm or channels <= 0:
+            return 0
+        frame_bytes = 2 * channels  # 只接受 16bit
+        usable = len(pcm) - (len(pcm) % frame_bytes)
+        step = 4096 * frame_bytes  # 约 128ms@32k，保证打断响应足够快
+        written = 0
+        for i in range(0, usable, step):
+            if interrupt.is_set():
+                break
+            arr = np.frombuffer(pcm[i:i + step], dtype=np.int16)
+            if channels > 1:
+                arr = arr.reshape(-1, channels)
+            stream.write(arr)
+            written += int(arr.shape[0])
+        return written
+
+    def _voice_stream_player_stream(self, ready_q, interrupt, typing_done,
+                                    session_done=None, sid=None):
+        """播放线程（增量）：按段把 PCM 分片实时写声卡；被打断立即停。
+
+        流式下拿不到整段时长，voice_segment 的时长用上一段实测语速估算；
+        段边界会强制对齐，漂移不会跨句累积。
+        """
+        import numpy as np  # noqa: F401
+        import sounddevice as sd
+
+        heard_first = False
+        interrupted = False
+        t0 = time.time()
+        stream = None
+        sr = ch = 0
+        cur = None  # (seg_text, wav_path, sr, ch)
+        seg_frames = 0
+        announced = False
+        spoken_parts = []  # 真正写完声卡的段文本（被打断时据此截断历史）
+        saw_end = False    # 是否消费到队列哨兵（正常播完）
+
+        def _chars(text):
+            return len(re.sub(r"[\s，。！？、,.!?…；;:：\"“”]", "", text or ""))
+
+        def _close_stream():
+            nonlocal stream, sr, ch
+            if stream is not None:
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            if getattr(self, "_active_stream", None) is stream:
+                self._active_stream = None
+            stream = None
+            sr = ch = 0
+
+        try:
+            if ready_q is None:
+                return
+            while True:
+                try:
+                    item = ready_q.get(timeout=0.5)
+                except queue.Empty:
+                    if interrupt.is_set():
+                        interrupted = True
+                        break
+                    continue
+                if item is None:
+                    saw_end = True
+                    break
+                if interrupt.is_set():
+                    self._discard_stream_item(item)
+                    interrupted = True
+                    break
+                kind = item[0] if isinstance(item, tuple) and item else ""
+                if kind == "seg":
+                    _, seg_text, wav_path, _sr, _ch, _sw = item
+                    cur = (seg_text, wav_path, _sr, _ch)
+                    seg_frames = 0
+                    announced = False
+                    continue
+                if kind == "pcm":
+                    if cur is None:
+                        continue
+                    seg_text, wav_path, _sr, _ch = cur
+                    if stream is None or _sr != sr or _ch != ch:
+                        _close_stream()
+                        stream = sd.OutputStream(
+                            samplerate=_sr, channels=_ch, dtype="int16",
+                            blocksize=1024,
+                        )
+                        stream.start()
+                        sr, ch = _sr, _ch
+                        self._active_stream = stream
+                    if not announced:
+                        announced = True
+                        est_ms = max(600.0, _chars(seg_text) * self._tts_ms_per_char)
+                        if sid is None or sid == self._stream_session:
+                            try:
+                                self.voice_segment.emit(seg_text, est_ms)
+                            except Exception:
+                                pass
+                        if not heard_first:
+                            heard_first = True
+                            self.log.emit(f"🔊 首句出声 {time.time() - t0:.1f}s")
+                            if sid is None or sid == self._stream_session:
+                                self._first_audio.set()
+                            self._release_deltas(sid)
+                            self.state_changed.emit("speaking")
+                    seg_frames += self._stream_write_pcm(stream, item[1], ch, interrupt)
+                    continue
+                if kind == "eos":
+                    _, frames, seg_text = item
+                    frames = seg_frames or frames or 0
+                    # 该段所有 PCM 已写完声卡 → 计入"已播出文本"
+                    if seg_frames > 0 and seg_text:
+                        spoken_parts.append(seg_text)
+                    if sr > 0 and frames > 0 and seg_text:
+                        _n = _chars(seg_text)
+                        if _n >= 1:
+                            per = frames * 1000.0 / (sr * _n)
+                            self._tts_ms_per_char = max(40.0, min(400.0, per))
+                            if sid is None or sid == self._stream_session:
+                                try:
+                                    self.voice_rhythm.emit(self._tts_ms_per_char)
+                                except Exception:
+                                    pass
+                    if cur is not None:
+                        try:
+                            os.remove(cur[1])
+                        except OSError:
+                            pass
+                    cur = None
+                    seg_frames = 0
+                    announced = False
+                    continue
+                # 不该出现：流式播放只消费 seg/pcm/eos
+                self._discard_stream_item(item)
+        except Exception as e:
+            # 打断时 abort 会让 write 抛异常，不用当成故障刷日志
+            interrupted = interrupt.is_set()
+            if not interrupted:
+                self.log.emit(f"❌ 语音出错: {e}")
+        finally:
+            # 播放端退出（含设备故障）时通知合成端停止，避免队列写满后线程卡死在 put
+            interrupt.set()
+            _close_stream()
+            # 播出文本快照：整段播完的 + 当前段已写出的部分（按帧比例估算字数）
+            if ready_q is not None:
+                if cur is not None and announced and seg_frames > 0:
+                    _seg = cur[0] or ""
+                    _n = _chars(_seg)
+                    # 注意：上面 _close_stream() 已把 sr 清零，这里用该段自身的采样率
+                    _sr = cur[2] or sr
+                    if _n >= 2 and _sr > 0:
+                        _est_ms = max(600.0, _n * self._tts_ms_per_char)
+                        _frac = min(1.0, seg_frames / (_est_ms / 1000.0 * _sr))
+                        _part = self._prefix_by_chars(_seg, int(_n * _frac))
+                        if _part:
+                            spoken_parts.append(_part)
+                _sid_eff = sid if sid is not None else self._stream_session
+                self._voice_spoken_sid = _sid_eff
+                self._voice_spoken_text = "".join(spoken_parts)
+                self._voice_incomplete = not saw_end
+                self._on_voice_turn_finished(
+                    _sid_eff, self._voice_spoken_text, not saw_end)
+            # 无论正常结束还是失败，都要放行被扣住的文字，避免气泡一直空着
+            if sid is None or sid == self._stream_session:
+                self._first_audio.set()
+            self._release_deltas(sid)
+            if sid is None or sid == self._stream_session:
+                self.voice_stream_end.emit()
+            # 清理未消费的分片与残留临时文件
+            while ready_q is not None:
+                try:
+                    item = ready_q.get_nowait()
+                except queue.Empty:
+                    break
+                self._discard_stream_item(item)
+            if cur is not None:
+                try:
+                    os.remove(cur[1])
+                except OSError:
+                    pass
+            evt = typing_done
+            if evt is not None and not evt.is_set() and not interrupted:
+                evt.wait(timeout=30)
+            if not interrupted:
+                self.state_changed.emit("idle")
+            if session_done is not None:
+                session_done.set()
 
     def interrupt_voice(self):
         """打断语音播放"""
@@ -1322,6 +1875,7 @@ class ChatController(QObject):
             return
         if self._voice_synth is None:
             self.log.emit("⚠️ 语音服务不可用")
+            self.voice_replay_state.emit(False)
             return
 
         def _run():
@@ -1332,12 +1886,14 @@ class ChatController(QObject):
                 self._stop_stream_voice()
                 clean = _clean_display_text(text, for_tts=True)
                 if self._voice_synth.synthesize(clean, wav_path):
+                    self.voice_replay_state.emit(True)
                     winsound.PlaySound(wav_path, winsound.SND_FILENAME)
                 else:
                     self.log.emit("⚠️ 语音合成失败")
             except Exception as e:
                 self.log.emit(f"❌ 语音重播失败: {e}")
             finally:
+                self.voice_replay_state.emit(False)
                 try:
                     if os.path.exists(wav_path):
                         os.remove(wav_path)

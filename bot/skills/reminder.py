@@ -292,6 +292,9 @@ def _schedule_reminder(target: datetime, content: str, desc: str, source: str, a
 
 
 def _fire_reminder(entry: dict):
+    # 已被任务页手动完成（移出列表）的提醒不再播报
+    if entry not in _active_reminders:
+        return
     try:
         _active_reminders.remove(entry)
     except ValueError:
@@ -309,6 +312,20 @@ def _fire_reminder(entry: dict):
 def get_active_reminders() -> list:
     """供 UI 任务页/首页卡片展示：返回待触发的提醒（按触发时间排序）"""
     return sorted(_active_reminders, key=lambda r: r["fire_at"])
+
+
+def complete_reminder(index: int) -> bool:
+    """把第 index 条待触发提醒标记为完成：移出列表并写盘，到点不再播报"""
+    reminders = get_active_reminders()
+    if index < 0 or index >= len(reminders):
+        return False
+    entry = reminders[index]
+    try:
+        _active_reminders.remove(entry)
+    except ValueError:
+        return False
+    _save_pending(_active_reminders)
+    return True
 
 
 def fire_reminder_for_test(content: str):

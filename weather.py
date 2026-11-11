@@ -67,9 +67,67 @@ WEATHER_CODE = {
     395: ("雷阵雪", "⛈"),
 }
 
+# WMO weather_code → (中文描述, emoji 图标)：Open-Meteo 备用源使用
+WMO_CODE = {
+    0: ("晴", "☀"), 1: ("大部晴朗", "🌤"), 2: ("局部多云", "⛅"), 3: ("阴", "☁"),
+    45: ("有雾", "🌫"), 48: ("浓雾", "🌫"),
+    51: ("毛毛雨", "🌦"), 53: ("毛毛雨", "🌦"), 55: ("毛毛雨", "🌦"),
+    56: ("冻雨", "🌧"), 57: ("冻雨", "🌧"),
+    61: ("小雨", "🌦"), 63: ("中雨", "🌧"), 65: ("大雨", "🌧"),
+    66: ("冻雨", "🌧"), 67: ("冻雨", "🌧"),
+    71: ("小雪", "🌨"), 73: ("中雪", "❄"), 75: ("大雪", "❄"), 77: ("米雪", "🌨"),
+    80: ("阵雨", "🌦"), 81: ("中阵雨", "🌧"), 82: ("强阵雨", "⛈"),
+    85: ("阵雪", "🌨"), 86: ("强阵雪", "❄"),
+    95: ("雷雨", "⛈"), 96: ("雷雨伴冰雹", "⛈"), 99: ("雷雨伴冰雹", "⛈"),
+}
+
 _REFRESH_MS = 10 * 60 * 1000  # 10 分钟轮询（wttr.in 数据源本身约 30 分钟更新）
 _THROTTLE_S = 300             # 手动触发时 5 分钟内不重复请求
 _FIRST_DELAY_MS = 3000
+
+
+def _open_meteo_info(city: str) -> dict:
+    """Open-Meteo 备用源（wttr.in 连不上时用）：城市名 → 经纬度 → 实时天气"""
+    if not city:
+        raise ValueError("未配置城市")
+    geo_url = ("https://geocoding-api.open-meteo.com/v1/search?"
+               + urllib.parse.urlencode(
+                   {"name": city, "count": 1, "language": "zh", "format": "json"}))
+    with urllib.request.urlopen(
+            urllib.request.Request(geo_url, headers={"User-Agent": "curl/8"}), timeout=8) as resp:
+        geo = json.load(resp)
+    hit = (geo.get("results") or [None])[0]
+    if not hit:
+        raise ValueError("找不到城市：%s" % city)
+
+    params = {
+        "latitude": hit["latitude"],
+        "longitude": hit["longitude"],
+        "current": ("temperature_2m,apparent_temperature,relative_humidity_2m,"
+                    "weather_code,wind_speed_10m"),
+        "timezone": "auto",
+    }
+    url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(
+            urllib.request.Request(url, headers={"User-Agent": "curl/8"}), timeout=8) as resp:
+        data = json.load(resp)
+    cur = data.get("current") or {}
+    temp = cur.get("temperature_2m")
+    if temp is None:
+        raise ValueError("天气数据为空")
+    code = int(cur.get("weather_code") or 0)
+    desc, icon = WMO_CODE.get(code, ("未知", "🌡"))
+    return {
+        "temp": round(temp),
+        "feels": round(cur.get("apparent_temperature", temp)),
+        "desc": desc,
+        "icon": icon,
+        "code": code,
+        "humidity": round(cur.get("relative_humidity_2m", 0)),
+        "wind": round(cur.get("wind_speed_10m", 0)),
+        "city": city,
+        "ts": int(time.time()),
+    }
 
 
 class WeatherWorker(QObject):
@@ -140,10 +198,17 @@ class WeatherWorker(QObject):
             self._latest = info
             self.weather_ready.emit(info)
         except Exception as e:
-            print("[天气] 获取失败: %s" % e)
-            # 拉取失败也保留城市名 + 占位数据，前端胶囊不显示"未知"
+            print("[天气] wttr.in 失败: %s，改用 Open-Meteo" % e)
+            try:
+                info = _open_meteo_info(self.city)
+                self._latest = info
+                self.weather_ready.emit(info)
+                return
+            except Exception as e2:
+                print("[天气] 备用源也失败: %s" % e2)
+            # 两个源都失败也保留城市名 + 占位数据，前端胶囊不显示"未知"
             if self.city:
-                fallback = {"temp": "--", "feels": "--", "desc": "获取中", "icon": "🌡",
+                fallback = {"temp": "--", "feels": "--", "desc": "获取失败", "icon": "🌡",
                             "humidity": "--", "wind": "--", "city": self.city, "ts": 0}
                 self._latest = fallback
                 self.weather_ready.emit(fallback)

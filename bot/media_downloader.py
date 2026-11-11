@@ -7,6 +7,7 @@ import os
 import re
 import json
 import time
+import hashlib
 import requests
 import subprocess
 from pathlib import Path
@@ -96,29 +97,40 @@ class MediaDownloader:
         """
         图片搜索（改进方案）
         优先级：
-        1. 本地知识库的图片 URL（命中即返回）
-        2. B站官方搜索 API（api.bilibili.com，最稳）
-        3. 百度图片搜索（正则兜底）
-        4. 返回通用图片源占位符
-        
+        1. 百度图片 acjson（真人实拍/生活照为主，百度自己缓存，能外链）
+        2. Bing 图片（通用词兜底，按标题相关性排序）
+        3. B站官方搜索 API（角色/番剧类封面补充）
+        4. 百度图片 HTML 老接口（正则兜底）
+        5. 本地知识库的图片 URL（手工缓存，可能失效，放最后兜底）
+
         返回 [{"title": "...", "url": "...", "cover": "..."}]
         """
         try:
-            # 【优先】本地知识库
+            # 【优先】百度 acjson：微博/小红书用户实拍，比图库站素材更像「推特那种真人图」
+            baidu_ac = self._search_baidu_acjson(keyword, max_results)
+            if baidu_ac:
+                return baidu_ac
+
+            # 【降级1】Bing 图片
+            bing_images = self._search_bing_images(keyword, max_results)
+            if bing_images:
+                return bing_images
+
+            # 【降级2】B站官方 API（角色立绘类关键词的封面通常质量不错）
+            bili_images = self._search_bilibili_api(keyword, max_results)
+            if bili_images:
+                return bili_images
+
+            # 【降级3】百度图片老接口
+            baidu_images = self._search_baidu_images(keyword, max_results)
+            if baidu_images:
+                return baidu_images
+
+            # 【最后的兜底】本地知识库（手工维护，链接可能已失效，不能压过在线来源）
             local_images = self._get_local_images(keyword)
             if local_images:
                 print(f"[本地知识库] 找到 {len(local_images)} 张图片")
                 return local_images[:max_results]
-            
-            # 【B站官方API优先】
-            bili_images = self._search_bilibili_api(keyword, max_results)
-            if bili_images:
-                return bili_images
-            
-            # 【降级1】尝试百度图片搜索 API
-            baidu_images = self._search_baidu_images(keyword, max_results)
-            if baidu_images:
-                return baidu_images
 
             # 都没找到，返回空（调用方自行提示失败）
             print(f"[图片搜索] 未找到「{keyword}」的图片")
@@ -126,6 +138,100 @@ class MediaDownloader:
 
         except Exception as e:
             print(f"[图片搜索] 异常: {e}")
+            return []
+
+    def _search_baidu_acjson(self, keyword: str, max_results: int = 5) -> List[Dict]:
+        """百度图片 acjson 接口（真人实拍类首选）
+
+        返回的是百度自己缓存的图（img*.baidu.com），可以直接外链、不会裂图；
+        内容多来自微博/小红书/知乎等用户实拍，标题带 #大长腿# 这类话题，
+        比图库站的带水印素材更接近「推特上那种真人照片」。
+        """
+        import urllib.parse
+        try:
+            params = {
+                "tn": "resultjson_com", "logid": "1", "ipn": "rj", "ct": "201326592",
+                "is": "", "fp": "result", "fr": "", "word": keyword, "queryWord": keyword,
+                "cl": "2", "lm": "-1", "ie": "utf-8", "oe": "utf-8", "st": "-1",
+                "z": "", "ic": "", "hd": "", "latest": "", "copyright": "", "s": "",
+                "se": "", "tab": "", "width": "", "height": "", "face": "0",
+                "istype": "2", "expermode": "", "nojc": "", "isAsync": "",
+                "pn": "0", "rn": str(max(30, max_results)), "gsm": "1e",
+            }
+            url = "https://image.baidu.com/search/acjson?" + urllib.parse.urlencode(params)
+            headers = {**self.headers, "Referer": "https://image.baidu.com/"}
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json().get("data") or []
+            items = []
+            for it in data:
+                if not isinstance(it, dict):
+                    continue
+                pic = it.get("middleURL") or it.get("hoverURL") or it.get("thumbURL") or ""
+                if not pic.startswith(("http://", "https://")):
+                    continue
+                items.append({
+                    "title": it.get("fromPageTitleEnc") or keyword,
+                    "url": pic.replace("http://", "https://", 1),
+                    "cover": pic.replace("http://", "https://", 1),
+                    "source": "baidu_image",
+                })
+            print(f"[百度acjson] 找到 {len(items)} 张")
+            return items[:max_results]
+        except Exception as e:
+            print(f"[百度acjson] 失败: {e}")
+            return []
+
+    def _search_bing_images(self, keyword: str, max_results: int = 5) -> List[Dict]:
+        """Bing 图片搜索（解析 async 接口返回的 m 属性 JSON）
+
+        Bing 的缩略图域名（ts*.mm.bing.net）在国内常被重置，因此直接用 murl 原图。
+        结果按「标题包含关键词词元的个数」排序，把跑偏的结果压到后面。
+        """
+        import html as _html
+        import urllib.parse
+        try:
+            url = ("https://www.bing.com/images/async?q="
+                   + urllib.parse.quote(keyword)
+                   + "&first=0&count=35&mkt=zh-CN")
+            headers = {
+                **self.headers,
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Referer": "https://www.bing.com/images/search?q=" + urllib.parse.quote(keyword),
+            }
+            resp = requests.get(url, headers=headers, timeout=8)
+            resp.raise_for_status()
+            items = []
+            for raw in re.findall(r'm="([^"]+)"', resp.text):
+                try:
+                    d = json.loads(_html.unescape(raw))
+                except Exception:
+                    continue
+                pic = d.get("murl") or ""
+                if not pic.startswith(("http://", "https://")):
+                    continue
+                items.append({
+                    "title": d.get("t") or keyword,
+                    "url": pic,
+                    "cover": pic,
+                    "source": "bing_image",
+                })
+
+            if not items:
+                return []
+
+            # 关键词词元重合度排序（稳定排序，同分保持 Bing 原始顺序）
+            tokens = [t for t in re.split(r"\s+", keyword.strip()) if t]
+            def _score(it):
+                title = it["title"].lower()
+                return sum(1 for t in tokens if t.lower() in title)
+            if tokens:
+                items.sort(key=_score, reverse=True)
+
+            print(f"[Bing图片] 找到 {len(items)} 张，取前 {min(len(items), max_results)} 张")
+            return items[:max_results]
+        except Exception as e:
+            print(f"[Bing图片] 失败: {e}")
             return []
 
     def _search_bilibili_api(self, keyword: str, max_results: int = 5) -> List[Dict]:
@@ -334,8 +440,10 @@ class MediaDownloader:
         【改进】如果网络不可用，创建本地占位符或使用 PIL 生成一个简单的文本图片
         """
         try:
-            # 生成唯一的文件名
-            filename = f"{keyword}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            # 文件名带 URL 哈希：同一秒内下多张图时不会撞名互相覆盖
+            # （之前用秒级时间戳，三张图同名，前两张被第三张覆盖，看起来像"同一张糊了三遍"）
+            _h = hashlib.md5(image_url.encode("utf-8", "ignore")).hexdigest()[:8]
+            filename = f"{keyword}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_h}.jpg"
             filepath = self.image_dir / filename
             
             # 检查是否已下载过
@@ -463,7 +571,13 @@ class MediaDownloader:
             ]
             
             print(f"[视频下载] 开始下载: {video_url}")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            # yt-dlp 是 Python 程序，默认按系统代码页（GBK）写中文日志；
+            # 显式让子进程用 UTF-8 输出、父进程按 UTF-8 解码，避免日志乱码
+            _env = dict(os.environ)
+            _env["PYTHONIOENCODING"] = "utf-8"
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace",
+                                    env=_env, timeout=300)
             
             if result.returncode == 0 and filepath.exists():
                 print(f"[视频下载] ✓ {filename}")

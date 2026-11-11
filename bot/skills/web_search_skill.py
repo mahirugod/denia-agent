@@ -30,7 +30,7 @@ def web_search(query: str) -> str:
     """
     try:
         from web_search import (
-            search_multi,
+            search_with_entity_fallback,
             sort_by_recency,
             search_bilibili,
             is_game_news_query,
@@ -54,7 +54,7 @@ def web_search(query: str) -> str:
         if not result and is_game_news_query(query):
             result = search_bilibili(query)
         if not result:
-            result = search_multi(query)
+            result = search_with_entity_fallback(query)
             if result:
                 result = sort_by_recency(result)
                 result = extract_high_value_lines(result, query, limit=3)

@@ -141,6 +141,7 @@ def search_bing_lite(query: str, timeout: int = 6, fallback: bool = True) -> Opt
     html_text = resp.content.decode("utf-8", errors="ignore")
 
     seen = []
+    links = []
     for block in re.findall(r'<li class="b_algo[^"]*".*?</li>', html_text, re.S):
         title = ""
         snippet = ""
@@ -152,11 +153,17 @@ def search_bing_lite(query: str, timeout: int = 6, fallback: bool = True) -> Opt
             snippet = _clean_text(html.unescape(_strip_tags(m.group(1))))
         # 去掉 Bing 摘要末尾固定的"…阅读更多"
         snippet = re.sub(r'…?阅读更多$', '', snippet).strip()
+        # 顺便留下真实链接，深抓正文时直接复用，省一次 SERP 请求
+        m = re.search(r'<h2[^>]*>.*?href="([^"]+)"', block, re.S)
+        if title and m:
+            links.append((title, html.unescape(m.group(1))))
         if not title and not snippet:
             continue
         seen.append((title, snippet))
         if len(seen) >= 5:
             break
+
+    _cache_serp(query, links)
 
     if not seen:
         print("[轻量搜索] 未解析到结果（Bing 可能返回验证页/JS 页），试试百度")
@@ -228,12 +235,51 @@ _GAME_KW = [
     "卡池", "抽卡", "池子", "up", "UP", "限定", "复刻",
     "活动", "版本", "更新", "维护", "上线", "公测", "开服",
     "停服", "版本更新", "角色", "武器", "池子", "爆料",
+    # 卡牌 / 构筑 / 强度榜类问法
+    "卡组", "牌组", "构筑", "天梯", "强度榜", "节奏榜",
+    "配队", "阵容", "攻略", "wiki", "T0", "T1", "t0", "t1",
 ]
 
 _GAME_NAMES = [
     "鸣潮", "原神", "崩坏", "崩铁", "星穹", "绝区零",
     "王者荣耀", "明日方舟", "库洛", "战双", "深空",
+    # 卡牌 / 常见二次元与竞技游戏（补齐后这些游戏才会走游戏专用检索）
+    "影之诗", "炉石传说", "游戏王", "宝可梦", "万智牌",
+    "蔚蓝档案", "赛马娘", "碧蓝航线", "少女前线", "幻塔",
+    "永劫无间", "三角洲", "无畏契约", "英雄联盟", "暗区突围",
+    "第五人格", "蛋仔派对", "无限暖暖", "异环", "燕云十六声",
 ]
+
+# 中文游戏名 → 英文检索词：中文站内召回差时，英文名能显著提升准确率
+_GAME_EN = {
+    "影之诗": "Shadowverse",
+    "炉石传说": "Hearthstone",
+    "游戏王": "Yu-Gi-Oh",
+    "宝可梦": "Pokemon",
+    "万智牌": "Magic the Gathering",
+    "蔚蓝档案": "Blue Archive",
+    "赛马娘": "Uma Musume",
+    "碧蓝航线": "Azur Lane",
+    "少女前线": "Girls Frontline",
+    "明日方舟": "Arknights",
+    "鸣潮": "Wuthering Waves",
+    "原神": "Genshin Impact",
+    "绝区零": "Zenless Zone Zero",
+    "王者荣耀": "Honor of Kings",
+    "永劫无间": "Naraka Bladepoint",
+    "无畏契约": "Valorant",
+    "英雄联盟": "League of Legends",
+    "三角洲": "Delta Force",
+    "第五人格": "Identity V",
+    "蛋仔派对": "Eggy Party",
+    "无限暖暖": "Infinity Nikki",
+    "幻塔": "Tower of Fantasy",
+}
+
+
+def game_search_hint(topic: str) -> str:
+    """返回该游戏用于检索的英文名（没有则空串）"""
+    return _GAME_EN.get(topic or "", "")
 
 
 def is_game_news_query(text: str) -> bool:
@@ -294,19 +340,29 @@ def mark_and_rank_official(text: str) -> str:
 
 _BOILERPLATE = ("的最新相关信息", "相关搜索", "_百度百科", "汉典", "拼音", "部首", "笔画")
 
-def filter_game_lines(text: str, topic: str) -> str:
+def filter_game_lines(text: str, topic: str, require_topic: bool = True) -> str:
     """剔除不是本游戏的搜索结果（相关性过滤 + 去搜索引擎噪声）
 
-    规则：行里必须出现主题游戏名；不能提到别的游戏；不能是搜索页样板文字。
+    require_topic=True：行里必须出现主题游戏名（或英文名），适合通用网页结果；
+    require_topic=False：只排除"提到了别的游戏"的行，适合 B站这类已在
+    本游戏查询语境下的结果（很多攻略标题本身不含游戏名）。
     宁可返回空，也不把无关内容塞给模型。
     """
     if not topic:
         return text or ""
+    aliases = [topic.lower()]
+    _en = _GAME_EN.get(topic)
+    if _en:
+        aliases.append(_en.lower())
     keep = []
     for line in (text or "").splitlines():
         s = line.strip()
-        if not s or topic not in s:
+        if not s:
             continue
+        if require_topic:
+            low = s.lower()
+            if not any(a in low for a in aliases):
+                continue
         if any(h in s for h in _BOILERPLATE):
             continue
         if any(g in s for g in _OTHER_GAME_NAMES if g != topic):
@@ -575,15 +631,30 @@ _HIGH_VALUE_RE = _re.compile('|'.join(_HIGH_VALUE_PATTERNS))
 # 结果噪音：词典/百科释义、门户与栏目介绍、旅游攻略
 # 这些行看着像结果，但没有任何事实内容，注入后模型只能说"没查到"
 _DICT_NOISE_RE = _re.compile(
-    r"(汉语文字|字的解释|字的含义|拼音是|拼音为|部首|笔顺|汉语国学|新华字典|康熙字典|"
-    r"汉典|词典网|成语大全)"
+    r"(汉语文字|字的解释|字的含义|字的读音|拼音是|拼音为|拼音,|拼音，|部首|笔顺|笔画|"
+    r"汉语国学|汉语字典|汉语查|新华字典|康熙字典|汉典|词典网|成语大全|怎么读|"
+    r"（汉字）|\(汉字\))"
 )
 _TRAVEL_NOISE_RE = _re.compile(
     r"(旅游攻略|旅游景点|景点|必去|去哪儿玩|打卡攻略|旅游全攻略|自由行攻略|游玩)"
 )
 # 新闻类查询里的门户/栏目介绍页：讲的是"这个网站/节目是什么"，不是当天发生了什么
 _PORTAL_NOISE_RE = _re.compile(
-    r"(权威媒体|新闻网站|节目简介|栏目宗旨|栏目介绍|频道首页|创办于)"
+    r"(权威媒体|新闻网站|节目简介|栏目宗旨|栏目介绍|频道首页|创办于|"
+    r"提供最及时|新闻频道_)"
+)
+# 黄历/日历类 SEO 页：问新闻却返回「今日宜忌/黄道吉日」，没有任何时效信息
+_ALMANAC_NOISE_RE = _re.compile(
+    r"(黄历|老黄历|黄道吉日|吉日查询|宜忌|值神|吉神宜趋|冲煞|万年历|"
+    r"今天是什么日子|农历查询|阴历查询)"
+)
+# 「X是谁 / X是什么人」问句：取实体名，校验搜索结果是不是跑偏成同名汉字/别的词条
+_ENTITY_Q_RE = _re.compile(
+    r"^([\u4e00-\u9fffA-Za-z0-9·\s]{2,12}?)"
+    r"(?:是谁|是什么人|是干什么的|干什么的|是谁呀|是谁啊|是哪个)$"
+)
+_ENTITY_LEAD_RE = _re.compile(
+    r"^(?:你知道|知不知道|帮我看一下|告诉我|查一下|搜一下|请问|那么|帮我|麻烦|你|我|那)+"
 )
 
 
@@ -620,6 +691,117 @@ def _sanitize_snippet(line: str) -> str:
     return f"{head}{sep}{body}" if sep else body
 
 
+def _entity_of_query(query: str) -> str:
+    """从「X是谁 / X是什么人」这类问句里取出实体名（用于校验结果是否跑偏）"""
+    q = _re.sub(r"[\s？?。.!！，,]+$", "", (query or "").strip())
+    q = _re.sub(r"(?:吗|呢|吧|啊|呀)+$", "", q)
+    q = _ENTITY_LEAD_RE.sub("", q)
+    m = _ENTITY_Q_RE.match(q)
+    return m.group(1).strip() if m else ""
+
+
+def _entity_grams(entity: str) -> set:
+    """实体名切成二元字组：容忍同音近形（梁文峰 / 梁文锋 共享「梁文」）"""
+    s = _re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", entity or "")
+    if len(s) < 2:
+        return {s} if s else set()
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def _entity_hit(entity: str, text: str) -> bool:
+    """结果里是否真的命中了这个实体：完整实体，或至少两个二元组同时出现。
+    只命中一个二元组太松：问「梁文峰」时「梁文锋」词条里的「梁文」就足以骗过校验。"""
+    if not entity or not text:
+        return False
+    s = _re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", entity)
+    if s and s in text:
+        return True
+    grams = _entity_grams(entity)
+    if len(grams) <= 1:
+        return False
+    return sum(1 for g in grams if g in text) >= 2
+
+
+# ── 具体词条抽取（治「明日方舟 整合运动」被引擎拆成「明日」的问题）──
+# 搜索引擎对「游戏名 + 冷门专有名词」常只抓前半截：问整合运动，返回的却是
+# 明日方舟游戏简介、明日之后周年庆、词典里的「明日」释义，完全没有「整合运动」。
+# 这里把查询里的游戏名/疑问词/泛用词剥掉，只留真正要查的词条，用来校验结果。
+_SUBJECT_EXCLUDE = (
+    "天气", "气温", "下雨", "几点", "时间", "怎么", "如何", "为什么", "多少钱",
+    "价格", "汇率", "股价", "金价", "油价", "新闻", "资讯", "热搜", "热点", "头条",
+    "卡池", "抽卡", "活动", "版本", "更新", "攻略", "强度", "排行", "配队", "阵容",
+)
+_SUBJECT_STOP = {
+    "什么是", "是什么", "是谁", "什么", "介绍", "简介", "资料", "详细", "一下",
+    "帮我", "查一下", "搜一下", "看看", "说说", "讲讲", "关于", "相关", "具体",
+    "内容", "信息", "情况", "意思", "含义", "背景", "设定", "组织", "阵营",
+    "势力", "角色", "人物", "干员", "剧情", "故事", "游戏",
+    # 来源/站点词不是要查的词条，否则「整合运动 百度百科」会拿「百度百科」当主体
+    "百度百科", "百度", "维基百科", "维基", "wiki", "Wiki", "知乎", "官网", "公告",
+    "百科", "搜索结果",
+}
+_SUBJECT_LEAD_RE = _re.compile(
+    r"^(?:你知道|知不知道|帮我|麻烦|请问|查一下|搜一下|介绍一下|说说|讲讲|"
+    r"告诉我|看一下|看看|什么是|是什么|什么|怎样|怎么|如何|为什么)+"
+)
+_SUBJECT_TAIL_RE = _re.compile(
+    r"(?:是什么意思|什么意思|是什么|是谁|怎么样|怎么|多少|吗|呢|啊|呀|吧|的)$"
+)
+
+
+def _subject_terms(query: str):
+    """从查询里取出真正要查的词条（去掉游戏名/疑问词/泛用词），用于结果相关性校验。
+
+    新闻/行情/天气/游戏资讯类问句返回空列表：这些查询本来就没有单一词条，
+    套词条校验会把正常结果误杀。
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    if any(k in q for k in _SUBJECT_EXCLUDE):
+        return []
+    for g in _GAME_NAMES:
+        if g in q:
+            q = q.replace(g, " ")
+    q = _SUBJECT_LEAD_RE.sub("", q)
+    q = _SUBJECT_TAIL_RE.sub("", q)
+    terms = []
+    for t in _re.split(r"[\s,，、/\\|+]+", q):
+        t = t.strip("　:：？！?。.~～\"“”'‘’()（）[]【】")
+        if not (2 <= len(t) <= 6) or t in _SUBJECT_STOP:
+            continue
+        if _re.fullmatch(r"[0-9.]+", t):
+            continue
+        # 含口语虚词的是整句而不是词条（「之眼好玩吗」），别拿来卡结果
+        if any(ch in t for ch in "的了吗呢吧啊呀是想能会怎什好要玩买做用"):
+            continue
+        terms.append(t)
+    return terms[:2]
+
+
+def _subject_hit(text: str, term: str) -> bool:
+    """结果行里是否真的落到这个词条上（容忍繁简差异和「整合运动组织」这类后缀）。"""
+    if not text or not term:
+        return False
+    if term in text:
+        return True
+    # 「整合运动组织」这种查询，结果通常只写到「整合运动」
+    if len(term) >= 4 and term[:4] in text:
+        return True
+    try:
+        from text_utils import to_simplified
+        _t, _x = to_simplified(term), to_simplified(text)
+        if _t and _t in _x:
+            return True
+    except Exception:
+        pass
+    grams = _entity_grams(term)
+    if len(grams) <= 1:
+        return False
+    return sum(1 for g in grams if g in text) >= 2
+
+
+
 def extract_high_value_lines(search_result: str, query: str = "", limit: int = 5) -> str:
     """从搜索摘要里挑出含高价值信号（数字/日期/百分比/实体）的行。
 
@@ -641,6 +823,10 @@ def extract_high_value_lines(search_result: str, query: str = "", limit: int = 5
     _keep_travel = any(k in _q_low for k in ("旅游", "景点", "攻略", "好玩", "玩什么", "去哪"))
     # 新闻类查询才过滤门户/栏目介绍与城市百科（改写后可能只剩"天津新闻"，不再含"今天"）
     _news_query = any(k in _q_low for k in ("新闻", "资讯", "热点", "时事", "头条"))
+    # 用户就是在问黄历/日子时不过滤日历页
+    _keep_calendar = any(k in _q_low for k in (
+        "黄历", "日历", "农历", "阴历", "节气", "吉日", "宜忌", "日子", "哪天", "几号",
+    ))
     # 办事/政策类查询：百科与站点介绍页都不是答案，顺手一起滤掉
     _howto_query = any(k in _q_low for k in (
         "规定", "新规", "政策", "通知", "公告", "流程", "办理", "额度", "标准",
@@ -659,15 +845,37 @@ def extract_high_value_lines(search_result: str, query: str = "", limit: int = 5
             continue
         if (_news_query or _howto_query) and _PORTAL_NOISE_RE.search(ln):
             continue
+        if _news_query and not _keep_calendar and _ALMANAC_NOISE_RE.search(ln):
+            continue
         if (_news_query or _howto_query) and "百度百科" in ln:
             continue
         _filtered.append(ln)
     if _filtered:
         lines = _filtered
+    else:
+        # 整页都是词典/旅游/门户噪音：没有可用事实，直接当"没搜到"，
+        # 别把"梁字怎么写"这类释义喂给模型（实测模型据此回"搜出来全是汉字的释义"）
+        print("[搜索] 结果全是噪音，丢弃")
+        return ""
     # 去掉主语被截断的句子，再进入打分
     _sanitized = [s for s in (_sanitize_snippet(ln) for ln in lines) if s.strip()]
     if _sanitized:
         lines = _sanitized
+    # 问句里的实体一次都没出现 → 结果跑偏（问「梁文峰是谁」只搜回汉字「梁」的释义）
+    _ent = _entity_of_query(query)
+    if _ent and not any(g in ln for ln in lines for g in _entity_grams(_ent)):
+        print(f"[搜索] 结果与实体「{_ent}」无关，丢弃")
+        return ""
+    # 词条类查询：结果里必须出现真正要查的那个词条（容忍繁简）。
+    # 否则「明日方舟 整合运动」会被游戏简介/「明日之后」周年庆/「明日」词典条目占满。
+    _subj = _subject_terms(query)
+    if _subj and not _ent:
+        _hits = [ln for ln in lines if any(_subject_hit(ln, s) for s in _subj)]
+        if _hits:
+            lines = _hits
+        else:
+            print(f"[搜索] 结果没命中词条「{'/'.join(_subj)}」，丢弃")
+            return ""
     scored = []
     for idx, ln in enumerate(lines):
         score = 0
@@ -695,9 +903,225 @@ def extract_high_value_lines(search_result: str, query: str = "", limit: int = 5
     else:
         picked = []
     if not picked:
-        # 没有高价值行，原样返回
-        return search_result
+        # 没有高价值行：返回**过滤后**的行（至少已去掉词典/旅游/门户噪音），不要退回原始结果
+        return "\n".join(lines)
     return "\n".join(picked)
+
+
+_GOLD_KW = ("金价", "黄金价格", "黄金价", "黄金多少钱", "黄金现在多少")
+
+
+def is_gold_price_query(text: str) -> bool:
+    """金价类问句：摘要基本都是 SEO 标题（"今日金价查询表"），不含具体数字"""
+    t = (text or "").strip()
+    if any(k in t for k in _GOLD_KW):
+        return True
+    return ("黄金" in t or "金条" in t or "足金" in t) and (
+        "价格" in t or "多少钱" in t or "一克" in t or "每克" in t)
+
+
+def fetch_gold_price(timeout: int = 8) -> Optional[str]:
+    """实时金价（新浪行情接口）：沪金连续元/克 + 伦敦现货 / COMEX 美元/盎司"""
+    try:
+        r = requests.get(
+            "https://hq.sinajs.cn/list=nf_AU0,hf_XAU,hf_GC",
+            headers={
+                "Referer": "https://finance.sina.com.cn",
+                "User-Agent": _HOT_UA,
+            },
+            timeout=timeout,
+        )
+        r.encoding = "gbk"
+        rows = {}
+        for line in r.text.splitlines():
+            m = re.match(r'var hq_str_(\w+)="([^"]*)"', line.strip())
+            if m:
+                rows[m.group(1)] = m.group(2).split(",")
+        parts = []
+        au = rows.get("nf_AU0") or []
+        if len(au) > 8 and au[8]:
+            parts.append(f"沪金连续（人民币）：{au[8]} 元/克，今日区间 {au[4]}~{au[3]} 元/克")
+        xau = rows.get("hf_XAU") or []
+        if len(xau) > 5 and xau[0]:
+            parts.append(f"伦敦现货黄金：{xau[0]} 美元/盎司")
+        gc = rows.get("hf_GC") or []
+        if len(gc) > 5 and gc[0]:
+            parts.append(f"COMEX 黄金期货：{gc[0]} 美元/盎司")
+        if not parts:
+            return None
+        date = au[17] if len(au) > 17 else ""
+        print("[金价] 已取到实时行情")
+        return ("【实时金价" + (f"（{date}）" if date else "") + "】\n"
+                + "\n".join(parts)
+                + "\n（沪金连续是投资/期货参考价，金店首饰金按克价通常更高）")
+    except Exception as e:
+        print(f"[金价] 实时行情获取失败: {e}")
+        return None
+
+
+_QUOTE_KW = ("交易所", "期货", "行情", "股价", "金价", "油价", "汇率", "牌价", "现货",
+             "价格", "多少钱", "报价")
+
+# 摘要里通常拿不到数字/细节的问句：命中就深抓正文补足
+_BODY_KW = ("价格", "多少钱", "报价", "几点", "比分", "排名", "销量", "票房",
+            "股价", "汇率", "金价", "油价", "参数", "配置", "规格", "型号",
+            "发售", "发布时间", "政策", "公告", "条款", "规定")
+
+
+def _needs_body(query: str) -> bool:
+    return any(k in (query or "") for k in _BODY_KW)
+
+
+_SERP_CACHE = {}
+_SERP_TTL = 120
+
+
+def _cache_serp(query: str, items) -> None:
+    if not items:
+        return
+    if len(_SERP_CACHE) > 50:
+        _SERP_CACHE.clear()
+    _SERP_CACHE[query] = (time.time(), list(items))
+
+
+def _get_cached_serp(query: str):
+    hit = _SERP_CACHE.get(query)
+    if hit and time.time() - hit[0] <= _SERP_TTL:
+        return hit[1]
+    return None
+
+
+def _serp_items(query: str, timeout: int = 6, limit: int = 8):
+    """轻量解析 SERP，返回 [(title, url)]：比 search_bing_lite 多留真实链接，供深抓"""
+    cached = _get_cached_serp(query)
+    if cached:
+        return cached[:limit]
+    try:
+        resp = requests.get(
+            "https://cn.bing.com/search",
+            params={"q": query, "count": "10"},
+            headers={"User-Agent": _HOT_UA, "Accept-Language": "zh-CN,zh;q=0.9"},
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            return []
+        text = resp.content.decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+    items = []
+    for block in re.findall(r'<li class="b_algo[^"]*".*?</li>', text, re.S):
+        m = re.search(r'<h2[^>]*>.*?href="([^"]+)"', block, re.S)
+        if not m:
+            continue
+        url = html.unescape(m.group(1))
+        m2 = re.search(r'<h2[^>]*>(.*?)</h2>', block, re.S)
+        title = _clean_text(_strip_tags(html.unescape(m2.group(1))) if m2 else "")
+        items.append((title, url))
+        if len(items) >= limit:
+            break
+    _cache_serp(query, items)
+    return items
+
+
+def _has_fact_number(text: str) -> bool:
+    """摘要里已经带价格/比例/温度这类数值时，不必再深抓正文"""
+    return bool(_re.search(r"\d[\d,.]*\s*(元|美元|克|%|％|℃|度|万|亿|点)", text or ""))
+
+
+def _query_subject(query: str) -> str:
+    """取问句里的主体（「梁文峰是谁」「比特币价格 今天」→「梁文峰」「比特币」）"""
+    q = (query or "").strip()
+    keys = sorted(_BODY_KW + ("是多少", "多少钱", "多少", "今天", "今日", "现在",
+                              "目前", "最新", "是谁", "是什么人", "是什么",
+                              "是干什么的", "干什么的", "是哪个", "是谁呀", "是谁啊",
+                              "的"), key=len, reverse=True)
+    q = _re.sub("|".join(_re.escape(k) for k in keys), " ", q)
+    return _re.sub(r"\s+", " ", q).strip(" ?？。.!！，,")
+
+
+def fetch_body_excerpts(query: str, max_pages: int = 1) -> str:
+    """深抓正文：打开 SERP 前几条结果页，摘录正文，补足摘要里没有的数字和细节"""
+    items = [it for it in _serp_items(query) if _is_crawlable_url(it[1])]
+    items.sort(key=lambda x: -_score_url(x[1]))
+    # 问价格/行情时，优先抓标题里带"价格/行情/报价/走势"的页面
+    if any(k in query for k in ("价格", "多少钱", "报价", "股价", "金价", "油价", "汇率")):
+        _prio = ("价格", "行情", "报价", "走势", "最新价", "今日", "实时")
+        items.sort(key=lambda x: 0 if any(p in x[0] for p in _prio) else 1)
+    # 标题/链接不含主体时多半是跑偏结果（问比特币搜到"比特浏览器"），不浪费一次爬取
+    ent = _query_subject(query)
+    if ent:
+        items = [it for it in items if ent in it[0] or ent in it[1]]
+    # 价格类：百科只讲定义不讲价，优先抓行情/电商页
+    if any(k in query for k in ("价格", "多少钱", "报价", "金价", "油价", "股价", "汇率")):
+        _no_baike = [it for it in items if "baike.baidu.com" not in it[1]]
+        if _no_baike:
+            items = _no_baike
+    out = []
+    for title, url in items[:max_pages]:
+        # 用主体词做相关性校验：行情页正文里往往没有"价格 今天"这样的完整问句
+        body = crawl_page(url, timeout=6000, query=ent or query)
+        if body:
+            out.append(f"【{title or url[:40]}】\n{body}")
+    if out:
+        print(f"[深抓] 补入 {len(out)} 篇正文")
+    return "\n\n".join(out)
+
+
+def _rank_by_entity(result: str, ent: str) -> str:
+    """把提到实体的行排到最前，其余最多留 2 行：
+    名字同音（梁文峰 / 梁文锋）时，正确条目也能出现在答案前面"""
+    if not result or not ent:
+        return result
+    grams = _entity_grams(ent)
+    hit, rest = [], []
+    for ln in result.splitlines():
+        if ent in ln or any(g in ln for g in grams):
+            hit.append(ln)
+        else:
+            rest.append(ln)
+    return "\n".join(hit + rest[:2]) if hit else result
+
+
+def search_with_entity_fallback(query: str) -> str:
+    """search_multi + 实体校验：结果跑偏（问「梁文峰是谁」只搜回汉字「梁」的释义）时，
+    用「实体 简介」重搜一次。仍然跑偏就返回原结果，交给下游噪音过滤丢弃。"""
+    # 行情类问句：搜索摘要里没有具体数字，直接取实时行情
+    if is_gold_price_query(query):
+        _gold = fetch_gold_price()
+        if _gold:
+            return _gold
+    result = search_multi(query)
+    # 行情类不做实体回退：否则「上海黄金交易所」会被当成「上海」重搜成旅游攻略
+    _quote = any(k in query for k in _QUOTE_KW)
+    _ent = _entity_of_query(query)
+    # 词条类查询（"明日方舟 整合运动"）：引擎常只抓住游戏名，结果里完全没有
+    # 具体词条。这时用词条本身重搜一次，并只保留真正提到它的行。
+    _subj = _subject_terms(query)
+    if result and _subj and not _quote and not _ent \
+            and not any(_subject_hit(result, s) for s in _subj):
+        _s = _subj[0]
+        print(f"[搜索] 结果没落到词条「{_s}」，改用词条单独重搜")
+        _alt = search_multi(_s)
+        if _alt:
+            _hits = [ln for ln in _alt.splitlines() if _subject_hit(ln, _s)]
+            if _hits:
+                return "\n".join(_hits)
+    if result and _ent and not _quote and not _entity_hit(_ent, result):
+        print(f"[搜索] 结果不含实体「{_ent}」，改用「{_ent} 简介」重搜")
+        alt = search_multi(f"{_ent} 简介")
+        if alt and _entity_hit(_ent, alt):
+            return _rank_by_entity(alt, _ent)
+    # 数字/细节类问句：摘要通常没有具体数值，深抓前几条正文补上
+    if _needs_body(query) and not _has_fact_number(result):
+        _body = fetch_body_excerpts(query)
+        if _body:
+            return ((result or "") + "\n\n" + _body).strip()
+    if _ent and result and not _quote and not _entity_hit(_ent, result):
+        # 同音字/错字：引擎可能只按首字给结果，明确告诉模型别拿无关条目硬答
+        return (result + f"\n【提示】没搜到「{_ent}」的直接结果，可能是同音字或错字。"
+                f"如果你知道正确写法就直接按正确写法回答；拿不准就如实说没查到，"
+                f"不要用上面这些无关条目硬凑答案。").strip()
+    return _rank_by_entity(result, _ent) if _ent else result
 # ────────────────────────────────────────
 # 实时热搜榜（泛热点问句专用，方向 A）
 # 免 key / 免登录的公开接口，泛问句（"今天有什么新闻""最近有什么热点"）
@@ -970,6 +1394,21 @@ def _merge_dedup(*chunks) -> Optional[str]:
     return "\n".join(out) if out else None
 
 
+def _filter_official(merged: str, query: str) -> str:
+    """官方定向结果必须提到查询主体：否则「iPhone 17 价格」会混进 QQ 官网这类无关页"""
+    subj = _query_subject(query)
+    if not subj:
+        return merged
+    grams = _entity_grams(subj)
+    kept = []
+    for ln in (merged or "").splitlines():
+        if ln.startswith(_OFFICIAL_TAG.strip()):
+            if subj not in ln and not any(g in ln for g in grams):
+                continue
+        kept.append(ln)
+    return "\n".join(kept)
+
+
 def search_multi(query: str, timeout: int = 6) -> Optional[str]:
     """多引擎并发搜索：Bing + 百度 + 官方定向，合并去重（提升召回）。
 
@@ -1027,9 +1466,21 @@ def search_multi(query: str, timeout: int = 6) -> Optional[str]:
 
     if not bing and not baidu and not official:
         return None
+    # 官方定向结果逐行按主体过滤：Bing 对冷门/错字实体常返回完全无关的条目
+    if official:
+        _subj = _query_subject(query)
+        if _subj:
+            _grams = _entity_grams(_subj)
+            official = "\n".join(
+                ln for ln in official.splitlines()
+                if _subj in ln or any(g in ln for g in _grams)
+            ) or None
+            if not official:
+                print("[多引擎搜索] 官方定向结果与主体不符，全部丢弃")
     # 官方定向结果放前面参与去重，再统一打标记 + 前置排序
     merged = _merge_dedup(official, bing, baidu)
     merged = mark_and_rank_official(merged) if merged else None
+    merged = _filter_official(merged, query) if merged else None
     _official_n = sum(1 for ln in (merged or "").splitlines() if ln.startswith(_OFFICIAL_TAG.strip()))
     print(f"[多引擎搜索] Bing {len(bing.splitlines()) if bing else 0} 条 / 百度 "
           f"{len(baidu.splitlines()) if baidu else 0} 条 / 官方定向 "

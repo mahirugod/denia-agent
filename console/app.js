@@ -4,29 +4,30 @@ let bridge = null;      // Python 桥接对象
 let chatText = "";      // 当前流式回复累积文本
 let _stallEl = null;    // "先应答"占位气泡（首字未到时显示）
 
-// 连接状态指示
-function setConnStatus(text, ok) {
-    let el = document.getElementById('conn-status');
-    if (!el) {
-        el = document.createElement('span');
-        el.id = 'conn-status';
-        el.style.cssText = 'font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;';
-        document.querySelector('.topbar-right').insertBefore(el, document.querySelector('.status-dot'));
-    }
-    el.textContent = text;
-    el.style.background = ok ? 'rgba(0,245,255,0.15)' : 'rgba(255,45,163,0.15)';
-    el.style.color = ok ? '#00f5ff' : '#ff63bb';
-    el.style.border = '1px solid ' + (ok ? 'rgba(0,245,255,0.4)' : 'rgba(255,45,163,0.4)');
+// 连接状态：顶栏唯一的状态组件（在线 / 重连中 / 离线 + 最近检查时间）
+const CONN_LABEL = { online: '在线', reconnecting: '重连中', offline: '离线' };
+let _connDetail = '';
+
+function setConnStatus(state, detail) {
+    const pill = document.getElementById('conn-pill');
+    if (!pill) return;
+    if (detail !== undefined) _connDetail = detail;
+    const stamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    pill.dataset.state = state;
+    pill.dataset.tip = (_connDetail ? _connDetail + ' · ' : '') + '最近检查 ' + stamp;
+    const text = document.getElementById('conn-text');
+    if (text) text.textContent = CONN_LABEL[state] || state;
 }
 
 // 初始化 QWebChannel（带重试，确保 qt.webChannelTransport 就绪）
 function initBridge() {
     if (typeof QWebChannel === "undefined") {
         console.warn("qwebchannel.js 未加载，运行在 mock 模式");
-        setConnStatus("未连接", false);
+        setConnStatus("offline", "浏览器预览模式，未连接本地服务");
         setupMockBridge();
         return;
     }
+    setConnStatus("reconnecting", "正在建立本地连接");
     let tries = 0;
     function tryConnect() {
         if (typeof qt !== "undefined" && qt.webChannelTransport) {
@@ -34,7 +35,7 @@ function initBridge() {
                 bridge = channel.objects.bridge;
                 if (!bridge) {
                     console.error("QWebChannel 连接成功但 bridge 对象为空");
-                    setConnStatus("桥接失败", false);
+                    setConnStatus("offline", "桥接对象为空");
                     return;
                 }
                 // 调试：打印 bridge 暴露的属性
@@ -44,11 +45,20 @@ function initBridge() {
                 else console.warn("bridge.chat_started 不存在");
                 if (bridge.chat_delta) bridge.chat_delta.connect(onChatDelta);
                 else console.warn("bridge.chat_delta 不存在");
+                // 语速同步：后端按每句音频时长/字数算出每字毫秒，打字机跟着语音走
+                if (bridge.voice_rhythm) bridge.voice_rhythm.connect(function (ms) {
+                    const v = Number(ms);
+                    if (isFinite(v) && v >= 40 && v <= 400) _typeInterval = v;
+                });
+                if (bridge.voice_segment) bridge.voice_segment.connect(onVoiceSegment);
+                if (bridge.voice_stream_end) bridge.voice_stream_end.connect(onVoiceStreamEnd);
+                if (bridge.voice_replay_state) bridge.voice_replay_state.connect(onVoiceReplayState);
                 if (bridge.chat_stall) bridge.chat_stall.connect(onChatStall);
                 if (bridge.chat_clear) bridge.chat_clear.connect(onChatClear);
                 if (bridge.chat_partial) bridge.chat_partial.connect(onVoicePartial);
                 if (bridge.chat_finished) bridge.chat_finished.connect(onChatFinished);
                 else console.warn("bridge.chat_finished 不存在");
+                if (bridge.chat_final) bridge.chat_final.connect(onChatFinal);
                 if (bridge.chat_thinking) bridge.chat_thinking.connect(onChatThinking);
                 if (bridge.chat_failed) bridge.chat_failed.connect(onChatFailed);
                 if (bridge.service_updated) bridge.service_updated.connect(onServiceUpdated);
@@ -56,7 +66,6 @@ function initBridge() {
                 if (bridge.log) bridge.log.connect(onLog);
                 if (bridge.reminder_fired) {
                     bridge.reminder_fired.connect(showReminder);
-                    bridge.reminder_fired.connect(loadHomeCards);  // 提醒触发后刷新首页任务卡
                 }
                 if (bridge.emotion_changed) bridge.emotion_changed.connect(setHeroEmotion);
                 if (bridge.user_message) bridge.user_message.connect(onUserMessage);
@@ -66,9 +75,8 @@ function initBridge() {
                 if (bridge.image_message) bridge.image_message.connect(onImageMessage);
                 if (bridge.system_updated) bridge.system_updated.connect(renderSystemStatus);
                 console.log("[Console] 桥接已就绪");
-                setConnStatus("已连接", true);
+                setConnStatus("online", "本地服务已就绪");
                 refreshServices();
-                loadHomeCards();
                 loadWeather();
                 scheduleWarpPoll();
                 setupLogPanel();
@@ -80,9 +88,8 @@ function initBridge() {
                 setTimeout(tryConnect, 100);
             } else {
                 console.warn("qt.webChannelTransport 5 秒内未就绪，运行在 mock 模式");
-                setConnStatus("未连接", false);
+                setConnStatus("offline", "5 秒内未检测到本地服务");
                 setupMockBridge();
-                loadHomeCards();
             }
         }
     }
@@ -136,26 +143,31 @@ function setupMockBridge() {
         replay_voice: () => { console.log("[mock] replay voice"); },
         copy_text: (t) => { try { navigator.clipboard.writeText(t); } catch (e) { } },
         get_tasks: () => wrap(JSON.stringify([
-            { text: "整理终端灰度骨架", done: true, prio: "高" },
-            { text: "确认首页与对话结构", done: false, prio: "高" },
-            { text: "接入语音合成流式播放", done: false, prio: "中" },
+            { idx: 0, text: "整理终端灰度骨架", done: true, prio: "高" },
+            { idx: 1, text: "确认首页与对话结构", done: false, prio: "高" },
+            { idx: 2, text: "接入语音合成流式播放", done: false, prio: "中" },
         ])),
+        complete_task: () => { },
         get_services: () => wrap(JSON.stringify([
             { name: "warp", display: "Cloudflare WARP", state: "stopped" },
             { name: "gpt_sovits", display: "GPT-SoVITS 语音合成", state: "running" },
             { name: "napcat", display: "NapCat 消息桥接", state: "stopped" },
         ])),
         get_settings: () => wrap(JSON.stringify([
-            { label: "角色形象", value: "达妮娅", type: "str" },
-            { label: "默认缩放", value: "0.7x", type: "str" },
-            { label: "语音合成", value: "GPT-SoVITS", type: "str" },
-            { label: "LLM 模型", value: "qwen2.5:7b", type: "str" },
+            { label: "角色形象", value: "达妮娅", type: "readonly", group: "身份" },
+            { label: "默认缩放", value: "0.7x", type: "readonly", group: "外观" },
+            { label: "语音合成", value: "GPT-SoVITS", type: "readonly", group: "语音" },
+            { label: "LLM 模型", key: "model_name", value: "qwen2.5:7b", type: "model_select", group: "模型", options: [
+                { label: "qwen2.5:7b（本地）", value: "qwen2.5:7b" },
+                { label: "DeepSeek V4（云端）", value: "deepseek" },
+            ] },
+            { label: "启用 NapCat（QQ 消息转发）", key: "napcat", value: false, type: "bool", group: "运行" },
+            { label: "启动时自动检测并补齐服务", key: "autostart", value: true, type: "bool", group: "运行" },
         ])),
         get_weather: () => wrap("{}"),
         get_system_status: () => wrap("{}"),
         get_warp_status: () => wrap("{}"),
         get_recent_logs: () => wrap("[]"),
-        get_recent_traces: () => wrap("[]"),
         toggle_warp: () => { },
         start_service: () => { },
         stop_service: () => { },
@@ -270,13 +282,16 @@ navBtns.forEach(btn => {
         document.getElementById('page-' + target).classList.add('active');
         // 进入页面时刷新数据
         if (target === 'task') loadTasks();
-        if (target === 'home') loadHomeCards();
         if (target === 'status') loadSystemStatus();
         if (target === 'launch') refreshServices();
         if (target === 'settings') loadSettings();
         if (target === 'collab') btn.classList.remove('tool-pulse');
     });
 });
+
+// 状态页行内重试
+const statusRetryBtn = document.getElementById('status-retry');
+if (statusRetryBtn) statusRetryBtn.addEventListener('click', retrySystemStatus);
 
 // 首页底部卡片点击跳转（复用导航切换逻辑，自动刷新数据）
 document.querySelectorAll('.info-card[data-page]').forEach(card => {
@@ -286,19 +301,6 @@ document.querySelectorAll('.info-card[data-page]').forEach(card => {
         if (navBtn) navBtn.click();
     });
 });
-
-// ===== 首页协作卡片同步（展示协作页部分内容） =====
-function syncCollabCard() {
-    const title = document.getElementById('collab-card-title');
-    const desc = document.getElementById('collab-card-desc');
-    if (!title || !desc) return;
-    const goalEl = document.getElementById('banner-goal');
-    const stateEl = document.getElementById('ws-status-title');
-    const goal = (goalEl && goalEl.textContent) || '';
-    const state = (stateEl && stateEl.textContent) || '';
-    title.textContent = (goal && goal !== '等待新任务…') ? goal : '暂无协作';
-    desc.textContent = state || '空闲';
-}
 
 // ===== 问候语 =====
 function updateGreeting() {
@@ -317,6 +319,43 @@ updateGreeting();
 const VOICE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg>';
 const COPY_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
 const CHECK_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+const STOP_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>';
+
+// 气泡语音重播：同一时刻只允许一条在播，点第二次即打断
+let _voiceBtn = null;
+let _voiceTimer = null;
+
+function setVoicePlaying(btn) {
+    if (_voiceBtn === btn) return;
+    if (_voiceBtn) {
+        _voiceBtn.classList.remove('playing');
+        _voiceBtn.innerHTML = VOICE_ICON;
+        _voiceBtn.setAttribute('aria-label', '重播这句话');
+        _voiceBtn.setAttribute('data-tip', '重播这句话');
+    }
+    clearTimeout(_voiceTimer);
+    _voiceTimer = null;
+    _voiceBtn = btn;
+    if (btn) {
+        btn.classList.add('playing');
+        btn.innerHTML = STOP_ICON;
+        btn.setAttribute('aria-label', '停止播放');
+        btn.setAttribute('data-tip', '停止播放');
+        // 兜底：后端没回报状态时，30 秒后自动复位
+        _voiceTimer = setTimeout(() => setVoicePlaying(null), 30000);
+    }
+}
+
+function onVoiceReplayState(playing) {
+    if (!playing) {
+        setVoicePlaying(null);
+        return;
+    }
+    if (_voiceBtn) {
+        clearTimeout(_voiceTimer);
+        _voiceTimer = setTimeout(() => setVoicePlaying(null), 30000);
+    }
+}
 
 // 为一条 bot 消息绑定语音重播 / 复制按钮
 function bindBotActions(msgEl) {
@@ -325,13 +364,24 @@ function bindBotActions(msgEl) {
     const copyBtn = msgEl.querySelector('.act-copy');
     if (voiceBtn) {
         voiceBtn.addEventListener('click', () => {
-            const t = bubble.textContent.trim();
-            if (t && bridge && bridge.replay_voice) bridge.replay_voice(t);
+            const t = (bubble.dataset.raw || bubble.textContent).trim();
+            if (!t || !bridge) return;
+            // 已在播这条 → 停止；播别的 → 先打断再切过去
+            if (_voiceBtn === voiceBtn) {
+                try { if (bridge.interrupt_voice) bridge.interrupt_voice(); } catch (e) { }
+                setVoicePlaying(null);
+                return;
+            }
+            if (_voiceBtn) {
+                try { if (bridge.interrupt_voice) bridge.interrupt_voice(); } catch (e) { }
+            }
+            setVoicePlaying(voiceBtn);
+            if (bridge.replay_voice) bridge.replay_voice(t);
         });
     }
     if (copyBtn) {
         copyBtn.addEventListener('click', () => {
-            const t = bubble.textContent.trim();
+            const t = (bubble.dataset.raw || bubble.textContent).trim();
             if (!t) return;
             const done = () => {
                 copyBtn.classList.add('copied');
@@ -352,6 +402,87 @@ function bindBotActions(msgEl) {
     }
 }
 
+// 对话一开始就把首页大立绘收成小头像，消息区接管剩余高度
+function compactHero() {
+    const hero = document.getElementById('home-hero');
+    if (hero) hero.classList.add('compact');
+}
+
+// ===== 气泡富文本：轻量 Markdown（先转义，再渲染行内样式 / 列表 / 段落）=====
+// 流式半成品（未闭合的反引号、星号）按纯文本显示，不会吞字也不会报错。
+let _bubbleSrcLen = 0;   // 气泡当前显示内容的原文长度（渲染后 textContent 不含标记，不能当游标用）
+
+function _escapeHTML(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function _inlineMarkdown(s) {
+    return s
+        .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+        .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+}
+
+function renderRichText(text) {
+    const lines = _escapeHTML(text || '').split('\n');
+    let html = '';
+    let list = null;   // 'ul' | 'ol'
+    let para = [];
+    const flushPara = () => {
+        if (!para.length) return;
+        html += '<p>' + _inlineMarkdown(para.join('<br>')) + '</p>';
+        para = [];
+    };
+    const flushList = () => {
+        if (!list) return;
+        html += '</' + list + '>';
+        list = null;
+    };
+    for (const line of lines) {
+        const bullet = line.match(/^\s*[-*•]\s+(.*)$/);
+        const num = line.match(/^\s*\d+[.)]\s+(.*)$/);
+        if (bullet || num) {
+            flushPara();
+            const tag = bullet ? 'ul' : 'ol';
+            if (list !== tag) {
+                flushList();
+                html += '<' + tag + '>';
+                list = tag;
+            }
+            html += '<li>' + _inlineMarkdown((bullet || num)[1]) + '</li>';
+        } else if (!line.trim()) {
+            flushPara();
+            flushList();
+        } else {
+            flushList();
+            para.push(line);
+        }
+    }
+    flushPara();
+    flushList();
+    return html;
+}
+
+// 写入达妮娅气泡：同时记住原文，复制/重播用原文而不是渲染后的残留标记
+// track=false：这是旁路消息（提醒等），不影响当前流式气泡的语音游标
+function setBubbleText(el, text, track) {
+    if (!el) return;
+    text = text || '';
+    if (track !== false) _bubbleSrcLen = text.length;
+    el.dataset.raw = text;
+    el.innerHTML = renderRichText(text);
+}
+
+// 用户往上翻看历史时不要抢滚动条：只有本来就在底部才贴着新内容走
+function _isNearBottom(box) {
+    return !box || (box.scrollHeight - box.scrollTop - box.clientHeight) < 80;
+}
+
+function _pinBottom(box, wasNearBottom) {
+    if (box && wasNearBottom) box.scrollTop = box.scrollHeight;
+}
+
 function appendMsg(text, who) {
     const box = document.getElementById('chat-messages');
     const msg = document.createElement('div');
@@ -361,7 +492,7 @@ function appendMsg(text, who) {
             '<div class="msg-body">' +
             '<div class="msg-bubble" id="bot-msg-latest"></div>' +
             '<div class="msg-actions">' +
-            '<button class="msg-act act-voice" data-tip="播放语音">' + VOICE_ICON + '</button>' +
+            '<button class="msg-act act-voice" data-tip="重播这句话" aria-label="重播这句话">' + VOICE_ICON + '</button>' +
             '<button class="msg-act act-copy" data-tip="复制">' + COPY_ICON + '</button>' +
             '</div></div>';
         box.appendChild(msg);
@@ -372,6 +503,7 @@ function appendMsg(text, who) {
         box.appendChild(msg);
     }
     box.scrollTop = box.scrollHeight;
+    compactHero();
 }
 
 // 语音识别出的用户文本 → 回显为用户气泡（与键盘输入一致）
@@ -387,51 +519,109 @@ function showReminder(text) {
     const bubbles = box.querySelectorAll('.msg-bot .msg-bubble');
     const el = bubbles[bubbles.length - 1];
     if (el) {
-        el.textContent = text;
+        setBubbleText(el, text, false);
         if (el.id) el.removeAttribute('id');  // 不占用流式气泡标记
     }
     box.scrollTop = box.scrollHeight;
 }
 
-// 打字机队列：LLM 快吐 token 时不闪，固定 500ms/字匀速出现
+// 打字机队列：默认 80ms/字；有语音时由 voice_rhythm 按实际语速实时校正
 let _typeQueue = "";
 let _typeTimer = null;
+let _typeInterval = 80;
 let _streamEnded = false;
+let _finalText = null;      // 后端最终清洗文本：流结束后用来兜底替换气泡
+let _chatBubbleEl = null;   // 本轮气泡元素（id 摘掉后仍能拿到）
+
+// 段内时钟：voice_segment 到达后，本段文字按音频时长逐字揭示，段边界强制对齐
+let _voiceSync = false;     // 是否已进入「字跟声音」模式
+let _voiceBase = "";        // 已播完的段落文本
+let _curSegText = "";       // 当前正在播的段落
+let _curSegDur = 0;         // 当前段音频时长（ms）
+let _curSegT0 = 0;          // 当前段开播时刻（performance.now）
+let _segStartMs = [];       // 本段每个字的起始偏移（标点加权重，句内停顿更准）
+let _segRaf = null;
+let _voiceEnded = false;
+let _voiceFinalized = false;
 
 function onChatStarted() {
+    compactHero();
+    setVoicePlaying(null);
+    const existing = document.getElementById('bot-msg-latest');
+    const prevText = chatText;
+    const prevQueue = _typeQueue;
+    if (existing && (prevText || prevQueue)) {
+        // 上一轮还在打字就被新消息打断：剩余文字直接落回旧气泡并定稿
+        setBubbleText(existing, _finalText || (prevText + prevQueue), false);
+        existing.removeAttribute('id');
+    }
+    _bubbleSrcLen = 0;
     chatText = "";
     _typeQueue = "";
+    _typeInterval = 80;
     _streamEnded = false;
     _stallEl = null;
+    _finalText = null;
+    _voiceSync = false;
+    _voiceBase = "";
+    _curSegText = "";
+    _curSegDur = 0;
+    _voiceEnded = false;
+    _voiceFinalized = false;
+    if (_segRaf) { cancelAnimationFrame(_segRaf); _segRaf = null; }
     if (_typeTimer) { clearTimeout(_typeTimer); _typeTimer = null; }
-    const existing = document.getElementById('bot-msg-latest');
-    if (existing) {
-        // 重试场景：复用已有气泡并清零，避免新建第二个气泡
-        existing.textContent = "";
+    if (existing && !prevText && !prevQueue) {
+        // 同一轮的重复 started：复用空气泡，避免出现两个空气泡
+        setBubbleText(existing, "");
+        _chatBubbleEl = existing;
     } else {
         appendMsg("", "bot");
+        _chatBubbleEl = document.getElementById('bot-msg-latest');
     }
 }
 
 function _typePump() {
-    const el = document.getElementById('bot-msg-latest');
+    const el = document.getElementById('bot-msg-latest') || _chatBubbleEl;
     if (!el) { _typeQueue = ""; _typeTimer = null; return; }
-    if (_typeQueue.length > 0) {
-        chatText += _typeQueue[0];
-        _typeQueue = _typeQueue.slice(1);
-        el.textContent = chatText;
+
+    // prefers-reduced-motion：一次性倒完所有剩余字符，不做逐字蹦
+    if (matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        if (_typeQueue.length) chatText += _typeQueue;
+        _typeQueue = "";
+        setBubbleText(el, _finalText !== null ? _finalText : chatText);
+        _streamEnded = true;
+        el.removeAttribute('id');
         const box = document.getElementById('chat-messages');
-        box.scrollTop = box.scrollHeight;
-        // 积压多时自动加速：每 20 字把间隔缩短一半，最低 50ms
+        if (box) box.scrollTop = box.scrollHeight;
+        _applyFinalText(el);
+        collabFinish();
+        _typeTimer = null;
+        return;
+    }
+
+    if (_typeQueue.length > 0) {
+        const box = document.getElementById('chat-messages');
+        const atBottom = _isNearBottom(box);
+        // 积压越多一次吐越多：模型一次回几百字时，纯 1 字/80ms 会让气泡
+        // 落后好几秒，看起来就是"卡住不动"。这里按积压量平滑追赶。
         const backlog = _typeQueue.length;
-        const interval = backlog > 60 ? 50 : backlog > 30 ? 100 : 200;
+        const step = backlog > 96 ? 6 : backlog > 48 ? 4 : backlog > 24 ? 3
+            : backlog > 8 ? 2 : 1;
+        chatText += _typeQueue.slice(0, step);
+        _typeQueue = _typeQueue.slice(step);
+        setBubbleText(el, chatText);
+        _pinBottom(box, atBottom);
+        // 积压特别大时缩短间隔，尽快追上模型的输出
+        const interval = backlog > 96 ? Math.min(_typeInterval, 50) : _typeInterval;
         _typeTimer = setTimeout(_typePump, interval);
     } else {
         // 队列消化完
         if (_streamEnded) {
+            _applyFinalText(el);  // 打字机走完后用最终文本兜底（去掉流式残片）
             el.removeAttribute('id');
             const box = document.getElementById('chat-messages');
             if (box) box.scrollTop = box.scrollHeight;
+            collabFinish();
         }
         _typeTimer = null;
     }
@@ -442,7 +632,7 @@ function onChatStall(text) {
     if (chatText || _typeQueue.length > 0) return;
     const el = document.getElementById('bot-msg-latest');
     if (!el) return;
-    el.textContent = text;
+    setBubbleText(el, text);
     _stallEl = el;
     const box = document.getElementById('chat-messages');
     if (box) box.scrollTop = box.scrollHeight;
@@ -452,6 +642,7 @@ function onChatClear() {
     if (!_stallEl) return;
     if (chatText || _typeQueue.length > 0) { _stallEl = null; return; }
     _stallEl.textContent = "";
+    _bubbleSrcLen = 0;
     _stallEl = null;
 }
 
@@ -461,8 +652,33 @@ function onChatDelta(delta) {
         _stallEl.textContent = "";
         _stallEl = null;
     }
+    if (_voiceSync) return;  // 语音段接管显示：增量只留给最终文本兜底
     _typeQueue += delta;
     if (!_typeTimer) _typePump();
+}
+
+// 后端最终清洗文本（流结束后推一次）：等打字机走完再替换气泡，兜底流式残片
+function onChatFinal(text) {
+    if (!text) return;
+    _finalText = text;
+    if (_voiceSync && !_voiceEnded) return;  // 语音还在播：等播完再补齐尾巴，别抢在声音前
+    if (!_streamEnded || _typeTimer) return;  // 还在打字：交给 _typePump 收尾时替换
+    _applyFinalText(document.getElementById('bot-msg-latest') || _chatBubbleEl);
+}
+
+function _applyFinalText(el) {
+    if (_finalText === null) return;
+    const t = _finalText;
+    _finalText = null;
+    el = el || document.getElementById('bot-msg-latest') || _chatBubbleEl;
+    if (!el || t === chatText) return;
+    // 流式过程中拼出来的文本与最终清洗结果不一致（残片/半截标签）→ 整段替换
+    chatText = t;
+    _typeQueue = "";
+    if (_typeTimer) { clearTimeout(_typeTimer); _typeTimer = null; }
+    setBubbleText(el, t);
+    const box = document.getElementById('chat-messages');
+    if (box) box.scrollTop = box.scrollHeight;
 }
 
 // 思考链：在机器人气泡上方插一个可折叠的「达妮娅想了想」块
@@ -486,7 +702,106 @@ function onChatThinking(thinking) {
     box.scrollTop = box.scrollHeight;
 }
 
+// ===== 字音同步：以音频段为时钟，一段一段揭示文字 =====
+// 后端在每段 wav 真正开播前推 (本段文本, 该段时长ms)，所以事件到达时刻≈音频起点。
+function onVoiceSegment(text, durMs) {
+    const el = document.getElementById('bot-msg-latest') || _chatBubbleEl;
+    if (!el) return;
+    // 已经按普通打字机跑起来了（首句超时放行 / 语音不可用）：不再回跳抢文字
+    if (!_voiceSync && (chatText || _typeQueue)) return;
+    if (!_voiceSync) {
+        _voiceSync = true;
+        if (_typeTimer) { clearTimeout(_typeTimer); _typeTimer = null; }
+        _typeQueue = "";
+    }
+    if (_stallEl) { _stallEl.textContent = ""; _bubbleSrcLen = 0; _stallEl = null; }
+    _voiceBase += _curSegText;          // 上一段音频已播完：整段结算
+    _curSegText = text || "";
+    _curSegDur = Number(durMs) > 0 ? Number(durMs) : 0;
+    _curSegT0 = performance.now();
+    _buildSegTimeline(_curSegText, _curSegDur);
+    if (_segRaf) cancelAnimationFrame(_segRaf);
+    _voicePump();
+}
+
+// 标点加权：标点后的停顿占字数权重，让文字在逗号/句号处停一下再继续
+function _buildSegTimeline(text, durMs) {
+    const marks = "，。！？、；：…,.!?;:";
+    let acc = 0;
+    const starts = [];
+    const raw = [];
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        raw.push(acc);
+        acc += marks.includes(ch) ? 2.2 : (/\s/.test(ch) ? 0.25 : 1);
+    }
+    const total = acc || 1;
+    for (let i = 0; i < raw.length; i++) starts.push(durMs * raw[i] / total);
+    _segStartMs = starts;
+}
+
+function _voicePump() {
+    const el = document.getElementById('bot-msg-latest') || _chatBubbleEl;
+    if (!el) { _segRaf = null; return; }
+    const len = _curSegText.length;
+    let k = len;
+    if (_curSegDur > 0) {
+        const elapsed = performance.now() - _curSegT0;
+        k = 0;
+        while (k < len && _segStartMs[k] <= elapsed) k++;
+    }
+    const shown = _voiceBase + _curSegText.slice(0, k);
+    // 只增不减，避免段边界结算时文字倒跳；内容没变化就不重建 DOM
+    if (shown.length >= _bubbleSrcLen && shown !== el.dataset.raw) {
+        const box = document.getElementById('chat-messages');
+        const atBottom = _isNearBottom(box);
+        setBubbleText(el, shown);
+        chatText = shown;
+        _pinBottom(box, atBottom);
+    }
+    if (k < len) {
+        _segRaf = requestAnimationFrame(_voicePump);
+    } else {
+        _segRaf = null;
+    }
+}
+
+function onVoiceStreamEnd() {
+    if (!_voiceSync) return;  // 没进语音同步（语音关闭/合成失败）：不干预普通打字机
+    _voiceEnded = true;
+    if (_streamEnded) _finishVoice();
+}
+
+// 语音播完：把没读出来的尾巴（表情/代码/被截断部分）用最终文本补齐并定稿
+function _finishVoice() {
+    if (_voiceFinalized) return;
+    _voiceFinalized = true;
+    if (_segRaf) { cancelAnimationFrame(_segRaf); _segRaf = null; }
+    _voiceBase += _curSegText;
+    _curSegText = "";
+    const el = document.getElementById('bot-msg-latest') || _chatBubbleEl;
+    if (!el) return;
+    _typeQueue = "";
+    if (_typeTimer) { clearTimeout(_typeTimer); _typeTimer = null; }
+    if (_finalText !== null) {
+        _applyFinalText(el);
+    } else {
+        chatText = _voiceBase;
+        setBubbleText(el, _voiceBase);
+    }
+    el.removeAttribute('id');
+    const box = document.getElementById('chat-messages');
+    if (box) box.scrollTop = box.scrollHeight;
+    collabFinish();
+}
+
 function onChatFinished(errText) {
+    // 语音同步模式：文字进度跟着音频走，定稿要等 voice_stream_end
+    if (_voiceSync) {
+        _streamEnded = true;
+        if (_voiceEnded) _finishVoice();
+        return;
+    }
     // 整轮都没等到真实内容：把占位语定格成一条正常消息
     if (_stallEl && !chatText && _typeQueue.length === 0) {
         _stallEl.removeAttribute('id');
@@ -499,12 +814,13 @@ function onChatFinished(errText) {
         // 完全没收到内容，直接显示错误
         const el = document.getElementById('bot-msg-latest');
         if (el) {
-            el.textContent = errText;
+            setBubbleText(el, errText);
             el.removeAttribute('id');
         }
         chatText = "";
         const box = document.getElementById('chat-messages');
         if (box) box.scrollTop = box.scrollHeight;
+        collabError();
         return;
     }
     // 有内容（或队列还有剩余）：标记"定型"，pump 消化完后不再滚动
@@ -512,6 +828,11 @@ function onChatFinished(errText) {
     // 如果 pump 还没启动（极端情况：最后几个字符刚好在 pump 间隔内到达）
     if (!_typeTimer && _typeQueue.length > 0) {
         _typePump();
+    } else if (!_typeTimer && _typeQueue.length === 0) {
+        _applyFinalText(document.getElementById('bot-msg-latest') || _chatBubbleEl);
+        const el = document.getElementById('bot-msg-latest');
+        if (el) el.removeAttribute('id');
+        collabFinish();
     }
 }
 
@@ -521,7 +842,7 @@ function onChatFailed(err) {
     _stallEl = null;
     const el = document.getElementById('bot-msg-latest');
     if (el) {
-        el.textContent = "出错了… " + err;
+        setBubbleText(el, "出错了… " + err);
         el.removeAttribute('id');
     }
     collabError();
@@ -529,6 +850,8 @@ function onChatFailed(err) {
 
 // ===== 运行日志面板（启动页）=====
 const _MAX_LOG_LINES = 500;
+const _LOG_EMPTY_HTML = '<div class="log-empty"><div class="log-empty-title">暂无日志</div>' +
+    '<div class="log-empty-sub">服务启动、工具调用和报错都会输出到这里</div></div>';
 
 function _logLevelOf(t) {
     if (/❌|Traceback|失败|异常|超时|\berror\b/i.test(t)) return 'lv-err';
@@ -566,8 +889,9 @@ function loadRecentLogs() {
         if (!box) return;
         box.innerHTML = '';
         list.slice(-_MAX_LOG_LINES).forEach(appendLogLine);
+        if (!list.length) box.innerHTML = _LOG_EMPTY_HTML;
         const c = document.getElementById('log-count');
-        if (c) c.textContent = box.children.length;
+        if (c) c.textContent = list.length ? Math.min(list.length, _MAX_LOG_LINES) : 0;
         box.scrollTop = box.scrollHeight;
     }).catch(() => {});
 }
@@ -577,51 +901,11 @@ function setupLogPanel() {
     if (btn) btn.addEventListener('click', () => {
         const box = document.getElementById('log-box');
         if (!box) return;
-        box.innerHTML = '<div class="log-empty">暂无日志</div>';
+        box.innerHTML = _LOG_EMPTY_HTML;
         const c = document.getElementById('log-count');
         if (c) c.textContent = '0';
     });
     loadRecentLogs();
-    setupTracePanel();
-}
-
-// ===== 最近对话（启动页复盘：输入 / 直连工具 / 回复）=====
-function _escHtml(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
-        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-function loadTraces() {
-    if (!bridge || !bridge.get_recent_traces) return;
-    Promise.resolve(bridge.get_recent_traces()).then(raw => {
-        let rows = [];
-        try { rows = JSON.parse(raw || "[]"); } catch (e) { return; }
-        const box = document.getElementById('trace-box');
-        if (!box) return;
-        if (!rows.length) {
-            box.innerHTML = '<div class="log-empty">暂无对话记录</div>';
-        } else {
-            box.innerHTML = rows.map(r => {
-                const tool = r.tool
-                    ? `<span class="trace-tool">⚙ ${_escHtml(r.tool)}</span>`
-                    : '<span class="trace-tool trace-none">模型决策</span>';
-                return `<div class="trace-line">` +
-                    `<span class="trace-time">${_escHtml(r.ts)}</span>` +
-                    `<span class="trace-chat">${_escHtml(r.chat)}</span>` +
-                    `<span class="trace-text">${_escHtml(r.text)}</span>${tool}` +
-                    `<span class="trace-reply">→ ${_escHtml(r.reply)}</span></div>`;
-            }).join('');
-        }
-        const c = document.getElementById('trace-count');
-        if (c) c.textContent = rows.length;
-        box.scrollTop = box.scrollHeight;
-    }).catch(() => {});
-}
-
-function setupTracePanel() {
-    const btn = document.getElementById('trace-refresh');
-    if (btn) btn.addEventListener('click', loadTraces);
-    loadTraces();
 }
 
 // 流式语音识别：边说边把文字写进输入框；结束（空串）时还原用户原本的草稿
@@ -651,11 +935,81 @@ function sendMessage(inputEl) {
     bridge.send_message(text);
 }
 
+// 待发送图片：选图/粘贴后先在输入框上方预览，点缩略图看大图、可复制，再按发送
+let pendingImage = null;   // { dataUrl, name }
+
+function ensurePendingBar() {
+    let bar = document.getElementById('pending-image');
+    if (bar) return bar;
+    const inputBar = document.querySelector('.input-bar');
+    if (!inputBar) return null;
+    bar = document.createElement('div');
+    bar.id = 'pending-image';
+    bar.className = 'pending-image';
+    bar.style.display = 'none';
+    bar.innerHTML =
+        '<div class="pending-thumb"><img class="msg-img" alt="待发送图片" /></div>' +
+        '<div class="pending-info">' +
+        '<div class="pending-name"></div>' +
+        '<div class="pending-tip">点图片可预览放大</div>' +
+        '</div>' +
+        '<div class="pending-actions">' +
+        '<button class="lb-btn" data-act="copy">复制图片</button>' +
+        '<button class="lb-btn" data-act="remove">移除</button>' +
+        '</div>';
+    inputBar.parentNode.insertBefore(bar, inputBar);
+    bar.querySelector('[data-act="remove"]').addEventListener('click', clearPendingImage);
+    bar.querySelector('[data-act="copy"]').addEventListener('click', e => {
+        if (pendingImage) copyImage(pendingImage.dataUrl, e.currentTarget);
+    });
+    return bar;
+}
+
+function renderPendingImage() {
+    const bar = ensurePendingBar();
+    if (!bar) return;
+    if (!pendingImage) {
+        bar.style.display = 'none';
+        bar.querySelector('.pending-thumb .msg-img').removeAttribute('src');
+        return;
+    }
+    bar.querySelector('.pending-thumb .msg-img').src = pendingImage.dataUrl;
+    bar.querySelector('.pending-name').textContent = pendingImage.name || '图片';
+    bar.style.display = 'flex';
+}
+
+function setPendingImage(dataUrl, name) {
+    pendingImage = { dataUrl, name: name || 'pasted.jpg' };
+    renderPendingImage();
+}
+
+function clearPendingImage() {
+    pendingImage = null;
+    renderPendingImage();
+}
+
+// 有待发图片时，发送键先发图（带着输入框里的文字）；否则走普通文字发送
+function handleSend(inputEl) {
+    if (pendingImage && bridge && bridge.send_image) {
+        const text = inputEl.value.trim();
+        const img = pendingImage;
+        const b64 = img.dataUrl.split(',')[1] || '';
+        if (!b64) return;
+        appendImageMsg(img.dataUrl, text);
+        inputEl.value = '';
+        collabBegin(text || '看这张图');
+        bridge.send_image(b64, img.name, text);
+        clearPendingImage();
+        return;
+    }
+    sendMessage(inputEl);
+}
+
 // 首页输入框（对话已合并到首页）
     const input1 = document.getElementById('chat-input');
     const btn1 = document.getElementById('send-btn');
-    btn1.addEventListener('click', () => sendMessage(input1));
-    input1.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(input1); });
+    btn1.addEventListener('click', () => handleSend(input1));
+    input1.addEventListener('keydown', e => { if (e.key === 'Enter') handleSend(input1); });
 
 // ===== 发图入口（＋选择文件 / Ctrl+V 粘贴）=====
 // 前端先压到 ≤1400px 的 JPEG，base64 交给后端视觉模型：原图直传，不做文字描述中转
@@ -690,19 +1044,16 @@ function appendImageMsg(dataUrl, text) {
     msg.querySelector('.msg-img').src = dataUrl;
     if (text) msg.querySelector('.msg-img-caption').textContent = text;
     box.appendChild(msg);
+    compactHero();
     box.scrollTop = box.scrollHeight;
 }
 
 function sendImageFile(file) {
-    if (!file || !bridge || !bridge.send_image) return;
-    const prompt = input1.value.trim();
+    if (!file) return;
     compressImage(file).then(dataUrl => {
-        const b64 = dataUrl.split(',')[1] || '';
-        if (!b64) return;
-        appendImageMsg(dataUrl, prompt);
-        input1.value = '';
-        collabBegin(prompt || '看这张图');
-        bridge.send_image(b64, file.name || 'pasted.jpg', prompt);
+        setPendingImage(dataUrl, file.name || 'pasted.jpg');
+        // 选图后把焦点放回输入框：可以直接补一句说明，再按回车发送
+        if (input1) input1.focus();
     }).catch(() => onLog('[图片] 这张图读不出来，换一张试试'));
 }
 
@@ -939,12 +1290,58 @@ function _fmtKb(kb) {
     return kb.toFixed(0) + ' KB/s';
 }
 
+// ===== 电脑状态页：等待首次采样 / 就绪 / 失败三态 =====
+let _statusPendingTimer = null;
+
+// 迟迟没有数据时转入失败态，避免永远停在这句“等待首次采样…”
+function armStatusPendingTimeout() {
+    // 已在计时就不重置：否则每次轮询返回空数据都会把超时往后推
+    if (_statusPendingTimer !== null) return;
+    _statusPendingTimer = setTimeout(() => {
+        _statusPendingTimer = null;
+        const grid = document.getElementById('status-grid');
+        if (grid && grid.dataset.state === 'pending') {
+            setStatusPageState('error', '等待超时，点击重试');
+        }
+    }, 4000);
+}
+
+function setStatusPageState(state, detail) {
+    const grid = document.getElementById('status-grid');
+    if (!grid) return;
+    grid.classList.toggle('pending', state !== 'ready');
+    grid.dataset.state = state;
+    if (state === 'pending') {
+        armStatusPendingTimeout();
+    } else {
+        clearTimeout(_statusPendingTimer);
+        _statusPendingTimer = null;
+    }
+    const sub = document.getElementById('status-sub');
+    if (sub) {
+        if (state === 'ready') sub.textContent = '实时监控 · 每 3 秒刷新';
+        else if (state === 'error') sub.textContent = detail || '采样失败';
+        else sub.textContent = '等待首次采样…';
+    }
+    const retry = document.getElementById('status-retry');
+    if (retry) retry.style.display = state === 'error' ? '' : 'none';
+}
+
+function retrySystemStatus() {
+    setStatusPageState('pending');
+    loadSystemStatus();
+}
+
 function renderSystemStatus(raw) {
     let d;
-    try { d = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) { return; }
-    if (!d || !d.cpu) return;
+    try { d = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) {
+        setStatusPageState('error', '状态数据解析失败');
+        return;
+    }
+    if (!d || !d.cpu) { setStatusPageState('pending'); return; }
     const $ = (id) => document.getElementById(id);
     if (!$('cpu-percent')) return;
+    setStatusPageState('ready');
 
     // CPU
     const cpuP = Math.round(d.cpu.percent || 0);
@@ -1005,8 +1402,13 @@ function renderSystemStatus(raw) {
 function loadSystemStatus() {
     if (!bridge || !bridge.get_system_status) return;
     try {
-        Promise.resolve(bridge.get_system_status()).then(renderSystemStatus).catch(() => { });
-    } catch (e) { }
+        setStatusPageState('pending');
+        Promise.resolve(bridge.get_system_status())
+            .then(renderSystemStatus)
+            .catch(() => setStatusPageState('error', '获取电脑状态失败'));
+    } catch (e) {
+        setStatusPageState('error', '获取电脑状态失败');
+    }
 }
 
 function setWorkspace(dotCls, title, sub, contentTitle, contentSub) {
@@ -1020,7 +1422,6 @@ function setWorkspace(dotCls, title, sub, contentTitle, contentSub) {
     if (contentSub !== undefined) {
         document.getElementById('ws-content-sub').textContent = contentSub;
     }
-    syncCollabCard();
 }
 
 function collabBegin(goal) {
@@ -1125,6 +1526,7 @@ function onToolEvent(jsonStr) {
 
 function collabFinish() {
     collabRemoveThinking();
+    document.querySelector('.nav-btn[data-page="collab"]')?.classList.remove('tool-pulse');
     if (collabHasTool) {
         setBannerState('done', '已完成');
         setWorkspace('done', '已完成', '工具执行完毕',
@@ -1139,53 +1541,67 @@ function collabFinish() {
 
 function collabError() {
     collabRemoveThinking();
+    document.querySelector('.nav-btn[data-page="collab"]')?.classList.remove('tool-pulse');
     setBannerState('error', '出错了');
     setWorkspace('error', '出错了', '达妮娅回复失败', '处理异常', '请检查服务状态后重试');
 }
 
 // ===== 任务页 =====
+function taskLoadFailed() {
+    const container = document.querySelector('.task-list');
+    if (!container) return;
+    container.innerHTML = '<div class="empty-state"><div class="empty-title">任务加载失败</div>' +
+        '<div class="empty-sub">没能拿到任务数据<button type="button" class="inline-retry" id="task-retry">重试</button></div></div>';
+    const retry = document.getElementById('task-retry');
+    if (retry) retry.addEventListener('click', loadTasks);
+}
+
 function loadTasks() {
     if (!bridge || !bridge.get_tasks) return;
     bridge.get_tasks().then(raw => {
-        const list = JSON.parse(raw);
+        let list;
+        try { list = JSON.parse(raw); } catch (e) { taskLoadFailed(); return; }
+        if (!Array.isArray(list)) { taskLoadFailed(); return; }
         const container = document.querySelector('.task-list');
         container.innerHTML = "";
-        if (Array.isArray(list) && list.length === 0) {
-            container.innerHTML = '<div class="task-item"><span class="task-text" style="color:var(--text-dim)">暂无任务</span></div>';
+        if (list.length === 0) {
+            container.innerHTML = '<div class="empty-state"><div class="empty-title">暂无待办任务</div>' +
+                '<div class="empty-sub">和达妮娅说「帮我记一件事」，任务会出现在这里</div></div>';
             return;
         }
         list.forEach(t => {
             const item = document.createElement('div');
-            item.className = 'task-item';
+            item.className = 'task-item' + (t.done ? ' is-done' : '');
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.className = 'task-check';
+            cb.checked = !!t.done;
+            cb.setAttribute('aria-label', (t.text || '') + (t.done ? '，已完成' : '，待完成'));
+            const txt = document.createElement('span');
+            txt.className = 'task-text';
+            txt.textContent = t.text || '';
+            const prio = document.createElement('span');
             const prioClass = t.prio === '高' ? 'prio-high' : (t.prio === '中' ? 'prio-mid' : 'prio-low');
-            item.innerHTML = `
-                <span class="task-check ${t.done ? 'done' : ''}">${t.done ? '✓' : '○'}</span>
-                <span class="task-text">${t.text}</span>
-                <span class="task-prio ${prioClass}">${t.prio || ''}</span>`;
+            prio.className = 'task-prio ' + prioClass;
+            prio.textContent = t.prio || '';
+            item.appendChild(cb);
+            item.appendChild(txt);
+            item.appendChild(prio);
+            // 勾选即完成：后端取消对应提醒，随后刷新列表
+            cb.addEventListener('change', () => {
+                if (!cb.checked) return;
+                cb.disabled = true;
+                if (bridge && bridge.complete_task && t.idx !== undefined) {
+                    try { bridge.complete_task(t.idx); } catch (e) { }
+                    setTimeout(loadTasks, 400);
+                } else {
+                    cb.disabled = false;
+                    cb.checked = false;
+                }
+            });
             container.appendChild(item);
         });
-    });
-}
-
-// ===== 首页信息卡片（真实任务） =====
-function loadHomeCards() {
-    if (!bridge || !bridge.get_tasks) return;
-    bridge.get_tasks().then(raw => {
-        try {
-            const list = JSON.parse(raw);
-            const real = (Array.isArray(list) ? list : []).filter(t => t.text && t.text !== '暂无提醒任务');
-            const tEl = document.getElementById('task-title');
-            const dEl = document.getElementById('task-desc');
-            if (!tEl || !dEl) return;
-            if (real.length > 0) {
-                tEl.textContent = real[0].text;
-                dEl.textContent = real.length > 1 ? `还有 ${real.length - 1} 个进行中的提醒` : '到点会提醒你';
-            } else {
-                tEl.textContent = '暂无任务';
-                dEl.textContent = '让达妮娅帮你记一件事吧';
-            }
-        } catch (e) { /* 忽略解析失败 */ }
-    });
+    }).catch(taskLoadFailed);
 }
 
 // ===== 服务状态页 =====
@@ -1198,15 +1614,20 @@ function refreshServices() {
         list.forEach(s => {
             const item = document.createElement('div');
             item.className = 'service-item';
-            const stateClass = s.state === 'running' ? 'running' : 'stopped';
+            const stateClass = ['running', 'starting', 'failed'].includes(s.state) ? s.state : 'stopped';
             const stateText = { running: '运行中', stopped: '已停止', starting: '启动中', failed: '失败' }[s.state] || s.state;
+            const btnLabel = s.state === 'running' ? '停止'
+                : s.state === 'starting' ? '启动中'
+                : s.state === 'failed' ? '重试' : '启动';
             item.innerHTML = `
-                <span class="svc-name">${s.display}</span>
-                <div style="display:flex;gap:8px;align-items:center;">
+                <div class="svc-info">
+                    <span class="svc-name">${s.display}</span>
+                    ${s.note ? `<span class="svc-note">${s.note}</span>` : ''}
+                </div>
+                <div class="svc-actions">
                     <span class="svc-status ${stateClass}">${stateText}</span>
-                    <button class="svc-btn" data-name="${s.name}" data-action="${s.state === 'running' ? 'stop' : 'start'}">
-                        ${s.state === 'running' ? '停止' : '启动'}
-                    </button>
+                    <button class="svc-btn" data-name="${s.name}" data-action="${s.state === 'running' ? 'stop' : 'start'}"
+                        ${s.state === 'starting' ? 'disabled' : ''}>${btnLabel}</button>
                 </div>`;
             container.appendChild(item);
         });
@@ -1227,10 +1648,29 @@ function onServiceUpdated(jsonStr) {
 }
 
 // ===== 达妮娅发来的图片（page_image / image_search 等工具，桌面端无 QQ 会话时）=====
+
+// 推特式图片网格：1 张大图，2 张并排，3 张左大右两小，4 张以上九宫格
+function buildImageGrid(imgs) {
+    const grid = document.createElement('div');
+    grid.className = 'msg-img-grid';
+    grid.dataset.count = String(imgs.length);
+    imgs.forEach(it => {
+        const cell = document.createElement('div');
+        cell.className = 'msg-img-cell';
+        const img = document.createElement('img');
+        img.className = 'msg-img';
+        img.alt = it.name || '图片';
+        img.src = it.src;
+        cell.appendChild(img);
+        grid.appendChild(cell);
+    });
+    return grid;
+}
+
 function onImageMessage(raw) {
     let data = {};
     try { data = JSON.parse(raw || '{}'); } catch (e) { return; }
-    const imgs = data.images || [];
+    const imgs = (data.images || []).filter(it => it && it.src);
     if (!imgs.length) return;
     const box = document.getElementById('chat-messages');
     if (!box) return;
@@ -1238,19 +1678,75 @@ function onImageMessage(raw) {
     msg.className = 'msg msg-bot';
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble msg-bubble-img';
-    imgs.forEach(it => {
-        if (!it || !it.src) return;
-        const img = document.createElement('img');
-        img.className = 'msg-img';
-        img.alt = it.name || '图片';
-        img.src = it.src;
-        bubble.appendChild(img);
-    });
-    if (!bubble.children.length) return;
+    bubble.appendChild(buildImageGrid(imgs));
     msg.appendChild(bubble);
     box.appendChild(msg);
     box.scrollTop = box.scrollHeight;
 }
+
+// ===== 图片预览层（点击缩略图放大，可复制图片）=====
+let _lightbox = null;
+
+function ensureLightbox() {
+    if (_lightbox) return _lightbox;
+    const mask = document.createElement('div');
+    mask.className = 'img-lightbox';
+    mask.innerHTML =
+        '<div class="img-lightbox-tools">' +
+        '<button class="lb-btn" data-act="copy">复制图片</button>' +
+        '<button class="lb-btn" data-act="close">关闭</button></div>' +
+        '<img alt="预览" />';
+    document.body.appendChild(mask);
+
+    const img = mask.querySelector('img');
+    const close = () => {
+        mask.classList.remove('open');
+        setTimeout(() => { if (!mask.classList.contains('open')) img.removeAttribute('src'); }, 200);
+    };
+    mask.addEventListener('click', e => { if (e.target === mask) close(); });
+    mask.querySelector('[data-act="close"]').addEventListener('click', close);
+    mask.querySelector('[data-act="copy"]').addEventListener('click', e => copyImage(img.src, e.currentTarget));
+    document.addEventListener('keydown', e => {
+        if (e.key === 'Escape' && mask.classList.contains('open')) close();
+    });
+    _lightbox = mask;
+    return mask;
+}
+
+function openImagePreview(src) {
+    if (!src) return;
+    const mask = ensureLightbox();
+    mask.querySelector('img').src = src;
+    mask.classList.add('open');
+}
+
+async function copyImage(src, btn) {
+    if (!src) return;
+    const label = btn ? btn.dataset.label || btn.textContent : '';
+    if (btn) { btn.dataset.label = label; btn.disabled = true; btn.textContent = '复制中…'; }
+    let ok = false;
+    if (bridge && bridge.copy_image) {
+        try { ok = await bridge.copy_image(src); } catch (e) { ok = false; }
+    }
+    if (!ok) {
+        // 浏览器 mock 模式兜底
+        try {
+            const blob = await (await fetch(src)).blob();
+            await navigator.clipboard.write([new ClipboardItem({ [blob.type || 'image/png']: blob })]);
+            ok = true;
+        } catch (e) { ok = false; }
+    }
+    if (btn) {
+        btn.textContent = ok ? '已复制' : '复制失败';
+        setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 1600);
+    }
+}
+
+// 所有聊天图片（含用户自己发的）点一下都能放大预览
+document.addEventListener('click', e => {
+    const img = e.target.closest ? e.target.closest('.msg-img') : null;
+    if (img && img.src) openImagePreview(img.src);
+});
 
 // ===== 设置页 =====
 function onBiliLoginFinished(raw) {
@@ -1261,71 +1757,142 @@ function onBiliLoginFinished(raw) {
     loadSettings();
 }
 
+// ===== 设置页 =====
+let _settingsToastTimer = null;
+
+// 保存反馈：底部 toast + 撤销（撤销即写回原值并重渲染）
+function showSettingsToast(text, undo) {
+    const page = document.getElementById('page-settings');
+    if (!page) return;
+    let el = document.getElementById('settings-toast');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'settings-toast';
+        el.className = 'settings-toast';
+        el.setAttribute('role', 'status');
+        el.setAttribute('aria-live', 'polite');
+        page.appendChild(el);
+    }
+    el.innerHTML = '';
+    const msg = document.createElement('span');
+    msg.className = 'toast-msg';
+    msg.textContent = text;
+    el.appendChild(msg);
+    const hide = () => el.classList.remove('show');
+    if (undo) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'toast-undo';
+        btn.textContent = '撤销';
+        btn.addEventListener('click', () => { hide(); undo(); });
+        el.appendChild(btn);
+    }
+    el.classList.add('show');
+    clearTimeout(_settingsToastTimer);
+    _settingsToastTimer = setTimeout(hide, 4000);
+}
+
 function loadSettings() {
     if (!bridge || !bridge.get_settings) return;
     bridge.get_settings().then(raw => {
         const list = JSON.parse(raw);
         const container = document.querySelector('.settings-list');
         container.innerHTML = "";
+        let lastGroup = '';
         list.forEach(s => {
+            const group = s.group || '其他';
+            if (group !== lastGroup) {
+                const title = document.createElement('div');
+                title.className = 'set-group-title';
+                title.textContent = group;
+                container.appendChild(title);
+                lastGroup = group;
+            }
             const row = document.createElement('div');
             row.className = 'setting-row';
             if (s.type === 'bool') {
                 row.innerHTML = `
                     <span class="set-label">${s.label}</span>
                     <label class="switch">
-                        <input type="checkbox" ${s.value ? 'checked' : ''} data-key="${s.key}" />
+                        <input type="checkbox" ${s.value ? 'checked' : ''} data-key="${s.key}" data-old="${s.value ? 'true' : 'false'}" aria-label="${s.label}" />
                         <span class="slider"></span>
                     </label>`;
             } else if (s.type === 'model_select' && s.options) {
                 let opts = s.options.map(o =>
                     `<option value="${o.value}" ${o.value === s.value ? 'selected' : ''}>${o.label}</option>`
                 ).join('');
+                const selLabel = (s.options.find(o => o.value === s.value) || {}).label || s.value;
                 row.innerHTML = `
                     <span class="set-label">${s.label}</span>
-                    <select class="model-select" data-key="${s.key}">${opts}</select>`;
+                    <select class="model-select" data-key="${s.key}" data-old="${s.value}" aria-label="${s.label}" title="${String(selLabel).replace(/"/g, '&quot;')}">${opts}</select>`;
             } else if (s.type === 'str' && s.key) {
                 const inputVal = s.value ? s.value.replace(/"/g, '&quot;') : '';
                 row.innerHTML = `
                     <span class="set-label">${s.label}</span>
-                    <input type="text" class="setting-input" data-key="${s.key}" data-placeholder="${s.placeholder ? s.placeholder.replace(/"/g, '&quot;') : ''}" value="${inputVal}" placeholder="${s.placeholder || ''}" />`;
+                    <input type="text" class="setting-input" data-key="${s.key}" data-old="${inputVal}" data-label="${s.label}" aria-label="${s.label}" data-placeholder="${s.placeholder ? s.placeholder.replace(/"/g, '&quot;') : ''}" value="${inputVal}" placeholder="${s.placeholder || ''}" />`;
+            } else if (s.type === 'readonly') {
+                row.innerHTML = `
+                    <span class="set-label">${s.label}</span>
+                    <span class="set-value is-readonly">${s.value}</span>`;
             } else if (s.type === 'hint') {
                 row.classList.add('setting-hint-row');
                 row.innerHTML = `<span class="set-hint">${s.label}</span>`;
             } else if (s.type === 'action') {
+                row.classList.add('setting-action-row');
+                const actVal = String(s.value || '').replace(/"/g, '&quot;');
                 row.innerHTML = `
                     <span class="set-label">${s.label}</span>
-                    <span class="set-value">${s.value || ''}</span>
+                    <span class="set-value" title="${actVal}">${s.value || ''}</span>
                     <button class="btn-mini" data-action="${s.key}">${s.button || '执行'}</button>`;
             } else {
                 row.innerHTML = `
                     <span class="set-label">${s.label}</span>
-                    <span class="set-value">${s.value}</span>`;
+                    <span class="set-value is-readonly">${s.value}</span>`;
             }
             container.appendChild(row);
         });
         // bool 开关
         container.querySelectorAll('.switch input').forEach(cb => {
             cb.addEventListener('change', () => {
-                bridge.save_setting(cb.dataset.key, cb.checked ? 'true' : 'false');
+                const key = cb.dataset.key;
+                const old = cb.dataset.old;
+                bridge.save_setting(key, cb.checked ? 'true' : 'false');
+                showSettingsToast('已保存', () => {
+                    bridge.save_setting(key, old);
+                    setTimeout(loadSettings, 300);
+                });
             });
         });
         // 模型下拉框（切换后重新拉取设置，因为配置项条目会随模型类型变化）
         container.querySelectorAll('.model-select').forEach(sel => {
             sel.addEventListener('change', () => {
-                bridge.save_setting(sel.dataset.key, sel.value);
+                const key = sel.dataset.key;
+                const old = sel.dataset.old;
+                bridge.save_setting(key, sel.value);
+                showSettingsToast('已保存，模型将在下一次回复生效', () => {
+                    bridge.save_setting(key, old);
+                    setTimeout(loadSettings, 300);
+                });
                 // 延迟重渲染，避免 input 焦点状态丢失
                 setTimeout(() => loadSettings(), 600);
             });
         });
         // 文本输入框（带 key 的 str 类型）
         container.querySelectorAll('.setting-input').forEach(inp => {
-            inp.addEventListener('change', () => {
-                bridge.save_setting(inp.dataset.key, inp.value);
-            });
-            inp.addEventListener('blur', () => {
-                bridge.save_setting(inp.dataset.key, inp.value);
-            });
+            const commit = () => {
+                if (inp.value === inp.dataset.old) return;
+                const key = inp.dataset.key;
+                const prev = inp.dataset.old;
+                const label = inp.dataset.label || key;
+                inp.dataset.old = inp.value;
+                bridge.save_setting(key, inp.value);
+                showSettingsToast('已保存：' + label, () => {
+                    bridge.save_setting(key, prev);
+                    setTimeout(loadSettings, 300);
+                });
+            };
+            inp.addEventListener('change', commit);
+            inp.addEventListener('blur', commit);
         });
         // 操作按钮（扫码登录等）
         container.querySelectorAll('.btn-mini').forEach(btn => {
@@ -1337,7 +1904,7 @@ function loadSettings() {
                 }
             });
         });
-    });
+    }).catch(() => { });
 }
 
 // 给服务按钮加点样式（动态生成，放这里）

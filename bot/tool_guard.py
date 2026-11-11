@@ -34,6 +34,7 @@ _RESULT_LIMIT_OVERRIDE = {
     "read_book_chunk": 7000,   # 单块正文（含 6000 字上限 + 头尾说明）
     "continue_reading": 14000,  # 一次最多 5 块
     "note_book_chunk": 3000,   # 笔记回执
+    "read_book_notes": 8000,   # 翻笔记要能看到完整要点，不能砍到 400 字
 }
 
 

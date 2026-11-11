@@ -250,6 +250,17 @@ _SONG_PREFIX_PAT = _re.compile(
 )
 
 
+def _normalize_song_query(name: str) -> str:
+    """把「作品名+的+曲名」这类口语写法拆成空格分词，避免搜索接口把整串乱切。
+
+    例如「鸣潮的且听风吟」→「鸣潮 且听风吟」；歌名本身带「的」（如「四季的问候」）
+    拆开后仍能命中，不会丢字。
+    """
+    q = (name or "").strip()
+    q = _re.sub(r"(?<=[^\s])的(?=[^\s])", " ", q)
+    return _re.sub(r"\s+", " ", q).strip()
+
+
 def _search_song_id(song_name: str, platform: str = "163") -> dict | None:
     """搜索歌曲，返回 {id, title, singer} 或 None。
 
@@ -262,7 +273,7 @@ def _search_song_id(song_name: str, platform: str = "163") -> dict | None:
         try:
             resp = _req.get(
                 "https://music.163.com/api/search/get/web",
-                params={"s": song_name, "type": 1, "limit": 1, "offset": 0},
+                params={"s": song_name, "type": 1, "limit": 5, "offset": 0},
                 headers={"User-Agent": "Mozilla/5.0"},
                 timeout=8,
             )
@@ -270,6 +281,14 @@ def _search_song_id(song_name: str, platform: str = "163") -> dict | None:
             data = resp.json()
             songs = data.get("result", {}).get("songs", [])
             if songs:
+                # 搜索结果常混进无关歌：优先选标题命中查询词的，同分保持原排序
+                toks = [t for t in song_name.split() if len(t) >= 2]
+
+                def _hit(x):
+                    title = x.get("name") or ""
+                    return sum(1 for t in toks if t in title)
+
+                songs = sorted(songs, key=_hit, reverse=True)
                 s = songs[0]
                 artists = s.get("artists") or []
                 singer = "/".join(
@@ -382,39 +401,6 @@ def _flatten_reply(text: str) -> str:
     text = re.sub(r'\n+', ' ', text)
     # 去掉行首空白
     return text.strip()
-
-
-_TRACE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "qq_trace.jsonl")
-
-
-def _trace_turn(chat_type: str, chat_id, user_text: str, reply_text: str):
-    """记一轮对话，供控制台「最近对话」复盘（直连工具 = 快路径命中的工具）"""
-    try:
-        import dania_tools  # noqa: F401  确保技能包已注册（没加载过时会自动加载）
-        from tool_registry import match_tool
-        _info = match_tool(user_text or "")
-        tool = _info.name if _info else ""
-    except Exception:
-        tool = ""
-    rec = {
-        "ts": time.strftime("%H:%M:%S"),
-        "chat": "私聊" if chat_type == "private" else "群聊",
-        "chat_id": str(chat_id),
-        "text": (user_text or "")[:120],
-        "tool": tool,
-        "reply": (reply_text or "")[:160],
-    }
-    try:
-        os.makedirs(os.path.dirname(_TRACE_FILE), exist_ok=True)
-        with open(_TRACE_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        if os.path.getsize(_TRACE_FILE) > 256 * 1024:
-            with open(_TRACE_FILE, encoding="utf-8") as f:
-                tail = f.readlines()[-200:]
-            with open(_TRACE_FILE, "w", encoding="utf-8") as f:
-                f.writelines(tail)
-    except Exception:
-        pass
 
 
 def _split_reply(text: str, max_parts: int = 3, max_len: int = 35) -> list:
@@ -610,6 +596,23 @@ def _music_card_data(platform: str, result: dict) -> dict:
     return data
 
 
+def _record_action(chat_type: str, chat_id, user_id, note: str):
+    """把旁路动作（点歌等不经过 LLM 的操作）写进该会话历史。
+
+    这类操作没有模型回复文本，如果不记一笔，下一轮被追问
+    「你刚发的那首歌」就会完全不记得。
+    """
+    try:
+        sid = (f"private_{user_id}" if chat_type == "private"
+               else f"group_{chat_id}_{user_id}")
+        bot = bots.get(sid)
+        llm = getattr(bot, "llm", None) if bot else None
+        if llm:
+            llm.update_history("assistant", note)
+    except Exception as e:
+        print(f"[动作记录] 写入历史失败: {e}")
+
+
 def _handle_song_request(text: str, chat_type: str, chat_id: int, user_id: int) -> bool:
     """处理点歌请求。成功处理返回 True，跳过（非点歌）返回 False。
 
@@ -629,8 +632,8 @@ def _handle_song_request(text: str, chat_type: str, chat_id: int, user_id: int) 
             break
     display = _MUSIC_DISPLAY.get(platform, "网易云音乐")
 
-    # 搜索歌曲获取 ID
-    result = _search_song_id(song_name, platform)
+    # 搜索歌曲获取 ID（「鸣潮的且听风吟」这类写法先拆成空格分词，避免搜错）
+    result = _search_song_id(_normalize_song_query(song_name), platform)
     if not result or not result.get("id"):
         reply = f"嗯……我搜了搜，{display}里暂时没找到《{song_name}》呢。换个歌名或歌手我再搜一次？"
         if chat_type == "private":
@@ -639,6 +642,10 @@ def _handle_song_request(text: str, chat_type: str, chat_id: int, user_id: int) 
         else:
             send_group_msg(chat_id, reply)
             _last_reply_time["group"][chat_id] = time.time()
+        _record_action(
+            chat_type, chat_id, user_id,
+            f"（我刚才帮用户搜了《{song_name}》，{display}里没找到）",
+        )
         return True
 
     # 构建 CQ:music 卡片 + 文字说明
@@ -680,6 +687,11 @@ def _handle_song_request(text: str, chat_type: str, chat_id: int, user_id: int) 
             print(f"[群聊音乐卡片发送失败] {e}，降级为文字")
             send_group_msg(chat_id, prefix + "\n" + f"https://music.163.com/song?id={result['id']}")
         _last_reply_time["group"][chat_id] = time.time()
+    _record_action(
+        chat_type, chat_id, user_id,
+        f"（我刚才给用户放了一首歌：《{title}》，{singer}，"
+        f"是{display}的音乐卡片；用户追问时就是这一首）",
+    )
     return True
 
 
@@ -903,7 +915,6 @@ def process_message(data: dict):
             if _outbox.pending_count() == 0:
                 send_reply_split("private", user_id, reply)
             _flush_images("private", user_id)
-            _trace_turn("private", user_id, display_text, reply)
         except Exception as e:
             print(f"[错误] 处理私聊消息失败: {e}")
             import traceback
@@ -978,7 +989,6 @@ def process_message(data: dict):
             if _outbox.pending_count() == 0:
                 send_reply_split("group", group_id, reply)
             _flush_images("group", group_id)
-            _trace_turn("group", group_id, display_text, reply)
         except Exception as e:
             print(f"[错误] 处理群聊消息失败: {e}")
             import traceback

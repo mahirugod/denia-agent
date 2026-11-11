@@ -536,6 +536,9 @@ def _pick_x_search_images(page, limit: int, keyword: str = "") -> list:
             txt = (art.inner_text() or "").lower()
         except Exception:
             txt = ""
+        # 推广/广告位与用户要的内容无关，直接跳过
+        if "promoted" in txt or "推广" in txt or "广告" in txt:
+            continue
         score = 2 if kw and kw in txt else 0
         try:
             nodes = art.query_selector_all("img[src*='pbs.twimg.com/media']")
@@ -551,8 +554,11 @@ def _pick_x_search_images(page, limit: int, keyword: str = "") -> list:
                 cands.append((score, order, src))
             order += 1
     cands.sort(key=lambda x: (-x[0], x[1]))
+    # 命中关键词的推文够用时就只用它们，避免把整页无关配图都塞给用户
+    hits = [c for c in cands if c[0] > 0]
+    pool = hits if len(hits) >= max(2, limit // 2) else cands
     seen, out = set(), []
-    for _, _, src in cands:
+    for _, _, src in pool:
         base = src.lower().split("?")[0]
         if base in seen:
             continue
@@ -830,15 +836,17 @@ def search_x_images(keyword: str, count: int = 3) -> dict:
     kw = (keyword or "").strip()
     if not kw:
         return {"ok": False, "paths": [], "urls": [], "title": "", "error": "关键词是空的"}
-    # 默认按「热门/相关」排序，避免 f=live 把时间序的无关内容排前面
-    url = ("https://x.com/search?q=" + quote(f"{kw} filter:images")
+    # 默认按「热门/相关」排序，避免 f=live 把时间序的无关内容排前面；排除转推减少重复
+    url = ("https://x.com/search?q=" + quote(f"{kw} filter:images -filter:retweets")
            + "&src=typed_query")
     os.makedirs(PROFILE_DIR, exist_ok=True)
     proxy = _proxy_server()
     if proxy and _PROXY_DOWN["proxy"] == proxy and time.time() < _PROXY_DOWN["until"]:
         proxy = ""
+    # 首屏只有 3~4 条推文，要几张就往下翻几屏，否则永远只拿得到第一屏的图
+    scrolls = max(4, min(14, int(count or 3) + 2))
     job = {"type": "images", "url": url, "count": count, "timeout": 30000,
-           "settle": 2500, "scrolls": 2, "proxy": proxy, "keyword": kw,
+           "settle": 2500, "scrolls": scrolls, "proxy": proxy, "keyword": kw,
            "require": "article[data-testid='tweet']"}
     try:
         res = _submit(job, wait_seconds=140)

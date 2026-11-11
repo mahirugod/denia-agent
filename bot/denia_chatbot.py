@@ -348,17 +348,20 @@ class DeniaChatbot:
         
         return response
 
-    def get_response_stream(self, text: str, on_sentence=None, on_delta=None) -> str:
+    def get_response_stream(self, text: str, on_sentence=None, on_delta=None,
+                            spoken_provider=None) -> str:
         """流式获取回复（委托 LLM；句子/增量通过回调送出，历史由 LLM 内部记录）
 
         Args:
             text: 用户输入文本
             on_sentence(seg): 每凑齐一个完整句子回调一次（供 TTS 分句合成）
             on_delta(delta): 每个清洗后的增量文本回调一次（供打字机实时显示）
+            spoken_provider(): 被打断时返回本轮真正播出的文字（None=未打断）
         """
         if self.use_llm and self.llm is not None:
             return self.llm.get_response_stream(
-                text, on_sentence=on_sentence, on_delta=on_delta)
+                text, on_sentence=on_sentence, on_delta=on_delta,
+                spoken_provider=spoken_provider)
         # 非LLM模式：退化为一次性回复
         reply = self.get_response(text, play_voice=False)
         if on_sentence and reply:

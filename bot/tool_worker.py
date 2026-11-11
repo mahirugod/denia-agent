@@ -12,6 +12,14 @@ BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 if BOT_DIR not in sys.path:
     sys.path.insert(0, BOT_DIR)
 
+# 协议流强制 UTF-8：Windows 下子进程 stdout/stdin 默认跟随系统代码页（GBK），
+# 父进程按 UTF-8 读写，中文结果会整段变成乱码（搜索/天气/时间都受影响）
+try:
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 _PROTO = sys.stdout          # 协议专用通道（父进程的管道）
 sys.stdout = sys.stderr      # 其余 print 一律走 stderr
 

@@ -11,6 +11,7 @@
 - read_book_chunk：读第 N 块（默认 4000 字一块）
 - continue_reading：从上次读到的位置接着往下读 N 块（自动记进度）
 - note_book_chunk：把读完的一块提炼成要点笔记存进 books/<slug>/notes/，供之后被问起时检索
+- read_book_notes：翻看已整理的笔记（用户说「看看笔记」「回顾一下」时用）
 
 阅读进度存在 meta.json 的 read_upto 里，重读旧块不倒退，读完全书记到 chunks 总数。
 笔记会作为「书本笔记」被 knowledge_base 检索，是跨轮次记住书中内容的唯一来源。
@@ -27,10 +28,10 @@ from tool_registry import tool
 
 skill("book_intake", "接收并按块阅读书籍",
       tools=["list_books", "feed_book", "read_book_chunk", "continue_reading",
-             "note_book_chunk"])
+             "note_book_chunk", "read_book_notes"])
 
 SKILLS = ["list_books", "feed_book", "read_book_chunk", "continue_reading",
-          "note_book_chunk"]
+          "note_book_chunk", "read_book_notes"]
 SKILL_DESCRIPTION = "接收并按块阅读书籍"
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -406,3 +407,81 @@ def note_book_chunk(slug: str = "", index: int = 1, note: str = "") -> str:
     meta["note_upto"] = sorted(saved)
     _save_meta(slug, meta)
     return f"（已记下《{meta.get('title', slug)}》第 {i} 块的要点，共 {len(body)} 字）"
+
+
+@tool(
+    name="read_book_notes",
+    description=(
+        "翻看已经整理好的读书笔记（books/<slug>/notes/）。"
+        "用户说「看看笔记」「翻翻笔记」「回顾一下前面读的」时用它，不要凭空回忆书里的细节。"
+        "不传 slug：只有一本书就直接读它；有多本就翻最近在读的那本；都没读过才反问用户。"
+        "limit 默认最近 5 块，最多 12 块。"
+    ),
+    keywords=["看笔记", "翻笔记", "翻翻笔记", "查看笔记", "读书笔记", "回顾笔记"],
+    patterns=[
+        r"(?:看看|翻翻|查看|读一下|回顾).{0,4}笔记",
+        r"笔记.{0,4}(?:看看|翻翻|给我看)",
+    ],
+    parameters={
+        "type": "object",
+        "properties": {
+            "slug": {
+                "type": "string",
+                "description": "书名（list_books / feed_book 返回的 slug）；不确定就省略",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "读最近几块笔记，默认 5，最多 12",
+            },
+        },
+    },
+)
+def read_book_notes(slug: str = "", limit: int = 5) -> str:
+    """读取已整理的读书笔记，供回顾书中内容用"""
+    hint = ""
+    slug = (slug or "").strip()
+    if not slug:
+        shelf = _shelf()
+        if not shelf:
+            return "（我这边还没拆过书呢，没有笔记可以翻。）"
+        if len(shelf) > 1:
+            # 有多本时优先翻最近在读的那本，别每次都反问（用户说「看看笔记吧」时
+            # 十有八九指的就是手头这本）
+            with_notes = [b for b in shelf if _note_files(b.get("slug"))]
+            pool = with_notes or shelf
+            if not with_notes and not any(b.get("last_read") for b in pool):
+                names = "、".join(str(b.get("title") or b.get("slug")) for b in pool[:6])
+                return f"（我有好几本书的笔记：{names}。要看哪一本？）"
+            best = max(pool, key=lambda b: str(b.get("last_read") or ""))
+            slug = str(best.get("slug") or "")
+            hint = (f"（翻的是《{best.get('title') or slug}》的笔记，"
+                    f"要看别的就说书名）\n\n")
+        else:
+            slug = str(shelf[0].get("slug") or "")
+
+    meta = _load_meta(slug)
+    title = meta.get("title") or slug
+    files = _note_files(slug)
+    if not files:
+        return f"（《{title}》还没有笔记，我可能还没读到能记下来的地方。）"
+    try:
+        n = max(1, min(12, int(limit or 5)))
+    except (TypeError, ValueError):
+        n = 5
+
+    parts = []
+    for fn in files[-n:]:
+        body = _read_text(os.path.join(notes_dir(slug), fn)).strip()
+        if body:
+            parts.append(body)
+    if not parts:
+        return f"（《{title}》的笔记是空的。）"
+    return hint + f"【《{title}》读书笔记（最近 {len(parts)} 块）】\n\n" + "\n\n".join(parts)
+
+
+def _note_files(slug: str) -> list:
+    """某本书已写好的笔记文件名（按序号排序）"""
+    d = notes_dir(slug or "")
+    if not os.path.isdir(d):
+        return []
+    return sorted(f for f in os.listdir(d) if f.endswith(".md"))
