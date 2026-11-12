@@ -117,6 +117,20 @@ _DENIAL_RE = re.compile(
     r"你搞错|搞错了|没这回事|哪有这(?:事|回事)|你编的|别瞎编|胡说"
 )
 
+# 用户确认上一轮召回的记忆（"对，就是这样"）→ 记一次确认，衰减变慢。
+# 只认句首的肯定词，且要求紧跟标点/结尾：避免"对了""对不起"被误判。
+_CONFIRM_RE = re.compile(
+    r"^(?:嗯+|对|对的|对呀|是的|是呀|没错|确实|就是这样|你记得没错|记对了|说得对)"
+    r"(?:呀|啊|哦)?(?:[，,。！!~～…\s]|$)"
+)
+
+# 只读工具：同名同参重复调用可以直接短路，不会漏掉副作用
+_READONLY_TOOLS = frozenset({
+    "list_dir", "read_file", "query_time", "query_weather", "system_sense",
+    "model_detect", "read_clipboard", "ui_inspect", "list_books", "list_skills",
+    "load_skill", "read_skill_file", "bilibili_feed", "browse_url",
+})
+
 
 def cleanup_stale_history(active_file: str = ""):
     """归档长期未使用的会话历史（每个进程只跑一次）
@@ -2269,6 +2283,24 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         except Exception:
             pass
 
+    def _maybe_confirm_recall(self, text: str):
+        """用户确认上一轮召回的事实 → 记一次确认，让这条记忆衰减更慢。
+
+        只认短句里的句首肯定词：长句里的"对"多半不是对记忆的确认。
+        """
+        t = (text or "").strip()
+        if not t or len(t) > 16:
+            return
+        ids = list(getattr(self, "_last_recall_ids", []) or [])
+        if not ids or not _CONFIRM_RE.match(t):
+            return
+        try:
+            import memory_store as _ms
+            if _ms.confirm_recall(ids[0]):
+                print(f"[记忆] 用户确认，记忆更耐久：{ids[0]}")
+        except Exception:
+            pass
+
     def _extract_open_loop(self, text: str):
         """把"明天面试"这类未来事件存成到点会被追问的未闭环话题。
 
@@ -4104,6 +4136,8 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         budget_end = time.time() + 90          # 软性总预算，防失控（不是硬性上限）
         max_steps = max(1, self.harness.max_steps)
         _loop_thinking_acc = ""  # 累积本轮各步的思考链（不随 streamer 重置）
+        _call_cache = {}         # 只读工具：(名字, 参数) → 上次结果，重复调用直接短路
+        _nudges = 0              # 空回合纠偏次数，最多两次
 
         for _step in range(max_steps):
             _tc, _raw = [], []
@@ -4159,6 +4193,17 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                     calls = [_to_call(_picked[0].name, _picked[1])]
                     print(f"[工具循环] 文本标记兜底 → {_picked[0].name}")
 
+            # 空回合：既没回答也没调工具。本地小模型偶尔会这样卡住，
+            # 给一次明确指令让它继续；连续两次仍为空就落到最终轮收尾。
+            if (not calls and _raw and not (r or "").strip()
+                    and _nudges < 2 and _step < max_steps - 1):
+                _nudges += 1
+                msgs.append({"role": "system",
+                             "content": "（系统提醒：上一轮你既没有回答用户，也没有调用工具。"
+                                        "要么直接回答用户，要么调用工具继续。）"})
+                print(f"[工具循环] 第{_step + 1}轮空回合，注入纠偏（第 {_nudges} 次）")
+                continue
+
             if _step == max_steps - 1 or not calls or time.time() > budget_end:
                 # 最终轮：把压住的文字放出来（工具轮旁白已随 calls 判定丢弃）
                 if r:
@@ -4186,6 +4231,11 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                     return self._tool_msg(
                         c, f"（系统：没有 {c.get('name')} 这个工具，换个工具或直接说明做不到）")
                 args = _safe_json(c.get("arguments"))
+                # 只读工具：同名同参重复调用直接回上次结果，别为同一份数据再跑一遍
+                _ck = (info.name, json.dumps(args, ensure_ascii=False, sort_keys=True))
+                if info.name in _READONLY_TOOLS and _ck in _call_cache:
+                    print(f"[工具循环] 跳过重复只读调用: {info.name}")
+                    return self._tool_msg(c, _call_cache[_ck])
                 # 预搜索已有结果：完全重复的查询直接拒；换了关键词的最多放行一次
                 if info.name == "web_search" and getattr(self, "_presearch_done", False):
                     _q = (args.get("query") or args.get("q") or "").strip()
@@ -4214,6 +4264,8 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                 else:
                     ctx = _raw_ctx
                 ctx = self.guard.truncate(info, ctx)
+                if info.name in _READONLY_TOOLS and ctx and not ctx.startswith("（系统："):
+                    _call_cache[_ck] = ctx
                 if ctx and ctx.startswith("（系统："):
                     self.note_event("tool_fail")
                 executed.append(info.name)
@@ -4840,6 +4892,7 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         self._bump_relationship(user_input)  # 跨会话熟悉度：她和你越来越熟
         self._extract_open_loop(user_input)  # "明天面试"这种未来事件，到点会追问
         self._maybe_mark_dispute(user_input)  # 用户否认上一轮召回 → 异议计数
+        self._maybe_confirm_recall(user_input)  # 用户确认上一轮召回 → 确认计数
         self._extract_directive(user_input)  # "别再问X了" → 禁提指令
         self._pending_memory_block = self._long_memory_block(user_input)  # 召回旧事
 
@@ -5556,6 +5609,7 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         self._bump_relationship(user_input)  # 跨会话熟悉度
         self._extract_open_loop(user_input)  # 未来事件 → 到点追问
         self._maybe_mark_dispute(user_input)  # 否认上一轮召回 → 异议计数
+        self._maybe_confirm_recall(user_input)  # 确认上一轮召回 → 确认计数
         self._extract_directive(user_input)  # "别再问X了" → 禁提指令
         self._pending_memory_block = self._long_memory_block(user_input)  # 召回旧事
 

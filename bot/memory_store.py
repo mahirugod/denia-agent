@@ -166,6 +166,27 @@ def mark_disputed(ep_id: str) -> bool:
         return hit
 
 
+def confirm_recall(ep_id: str) -> bool:
+    """用户确认了某条记忆（"对，就是这样"）：确认计数 +1，衰减变慢。
+
+    和异议是一枚硬币的两面：被否认的事衰减更快，被确认过的事更耐久。
+    只记"确认过几次"，不改内容，避免召回反过来污染记忆本身。
+    """
+    if not ep_id:
+        return False
+    with _io_lock:
+        eps = load_episodes()
+        hit = False
+        for ep in eps:
+            if ep.get("id") == ep_id:
+                ep["confirms"] = int(ep.get("confirms") or 0) + 1
+                ep["last_confirm_ts"] = round(time.time(), 3)
+                hit = True
+        if hit:
+            _save_episodes(eps)
+        return hit
+
+
 # ── 作息节律（用户大概几点醒着）──
 # 主动搭话的固定 DND 窗口是拍脑袋的 23:00-08:00，作息不同的人会一直被吵醒或被错过。
 # 这里只记"哪个小时有动静"，不记内容；样本按 45 天半衰，换作息后会慢慢跟上。
@@ -302,6 +323,23 @@ def add_episode(text: str, kind: str = "event", mood: str = "",
         ep["valid_to"] = round(float(valid_to), 3)
     if extra:
         ep.update({k: v for k, v in extra.items() if v is not None})
+    # 写入时的显著性：与既有记忆正相反的陈述价值最高，先把重要度抬到 4，
+    # 免得它还没熬到整理阶段就被遗忘曲线刷掉（整理阶段还会再判一次冲突）。
+    if not superseded and kind in ("event", "preference", "promise") and ep["importance"] < 4:
+        _v = valence(text)
+        if _v:
+            try:
+                _others = active_episodes()[-200:]
+            except Exception:
+                _others = []
+            for old in reversed(_others):
+                if (valence(old.get("text") or "") or 0) == -_v \
+                        and _sim(text, old.get("text") or "") >= 0.45:
+                    ep["importance"] = 4
+                    ep["surprise"] = True
+                    ep["contradicts"] = old.get("id")
+                    print(f"[记忆] 与旧记忆相反，重要度提到 4：{text[:24]}")
+                    break
     with _io_lock:
         with open(_EPISODES, "a", encoding="utf-8") as f:
             f.write(json.dumps(ep, ensure_ascii=False) + "\n")
@@ -435,7 +473,9 @@ def score(ep: dict, now: float = None) -> float:
     now = now or time.time()
     days = max(0.0, (now - float(ep.get("ts") or 0)) / 86400.0)
     imp = float(ep.get("importance") or 3)
-    stable = _BASE_STABLE_DAYS * imp * (1.0 + float(ep.get("hits") or 0))
+    # 被用户确认过的记忆衰减更慢：确认和"被想起"分开记，确认才说明这件事是真的
+    _c = 1.0 + 0.5 * min(int(ep.get("confirms") or 0), 4)
+    stable = _BASE_STABLE_DAYS * imp * (1.0 + float(ep.get("hits") or 0)) * _c
     base = imp * pow(2.718281828, -days / stable)
     # 被否认过的记忆衰减更快；异议比"没被想起"更该影响强度
     d = disputes(ep, now)
@@ -495,6 +535,18 @@ def _lexical_scores(query: str, eps: list) -> list:
     if not q:
         return [0.0] * len(eps)
     return [len(q & _grams(ep["text"])) / len(q) for ep in eps]
+
+
+def _sim(a: str, b: str) -> float:
+    """2-gram Jaccard 相似度：同主题判断用，代价为零。"""
+    ga, gb = _grams(a), _grams(b)
+    if not ga or not gb:
+        return 0.0
+    return len(ga & gb) / len(ga | gb)
+
+
+# 冷记录（被合并/取代的旧条目）解析回后继条目的最低词法分
+_RESOLVE_MIN = 0.30
 
 
 # ── 情绪一致的记忆更容易被想起 ──
@@ -676,12 +728,52 @@ def recall(query: str, k: int = 4, mood: float = 0, stats: dict = None,
             target = eps[i]
             target["hits"] = int(target.get("hits") or 0) + 1
             target["last_hit"] = round(time.time(), 3)
+        # 向前解析：整理阶段被合并/取代的旧条目不再参与常规召回，但用户仍可能
+        # 用当初的原话问起。命中冷记录时解析到它变成的那条，而不是让
+        # "整理得越好越找不到"。只用语义词法，避免向量缓存因候选集变化反复重建。
+        _n_active = len(out)
+        if len(out) < k:
+            seen = {e.get("id") for e in out}
+            cold = [e for e in all_eps
+                    if (e.get("merged_into") or e.get("superseded_by"))
+                    and not e.get("valid_to")]
+            if cold:
+                by_id = {e.get("id"): e for e in all_eps}
+                best = {}
+                for e, s in zip(cold, _lexical_scores(query, cold)):
+                    if s < _RESOLVE_MIN:
+                        continue
+                    tgt = by_id.get(e.get("merged_into") or e.get("superseded_by"))
+                    hop = 0
+                    while tgt and (tgt.get("merged_into") or tgt.get("superseded_by")) and hop < 4:
+                        nxt = by_id.get(tgt.get("merged_into") or tgt.get("superseded_by"))
+                        if not nxt or nxt is tgt:
+                            break
+                        tgt = nxt
+                        hop += 1
+                    if not tgt or tgt.get("id") in seen:
+                        continue
+                    prev = best.get(tgt["id"])
+                    if prev is None or s > prev[0]:
+                        best[tgt["id"]] = (s, tgt)
+                for s, tgt in sorted(best.values(), key=lambda x: x[0], reverse=True):
+                    if len(out) >= k:
+                        break
+                    ep = dict(tgt)
+                    ep["_score"] = round(float(s), 3)
+                    ep["_resolved"] = True
+                    out.append(ep)
+                    seen.add(tgt.get("id"))
+                    tgt["hits"] = int(tgt.get("hits") or 0) + 1
+                    tgt["last_hit"] = round(time.time(), 3)
+                    if isinstance(stats, dict):
+                        stats["resolved"] = stats.get("resolved", 0) + 1
         if out:
             _save_episodes(all_eps)
         if isinstance(stats, dict):
             stats["count"] = len(out)
-            stats["boosted"] = sum(1 for i in order[:len(out)] if boosts[i] > 1.0)
-            stats["suppressed"] = sum(1 for i in order[:len(out)] if boosts[i] < 1.0)
+            stats["boosted"] = sum(1 for i in order[:_n_active] if boosts[i] > 1.0)
+            stats["suppressed"] = sum(1 for i in order[:_n_active] if boosts[i] < 1.0)
         return out
 
 
