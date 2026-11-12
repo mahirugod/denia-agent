@@ -78,6 +78,55 @@ def _strip_inner_os(text: str) -> str:
     return _INNER_OS_RE.sub("", text or "").strip()
 
 
+# 环境感知：只取前台进程名做粗分类，不读窗口标题，避免把隐私内容带进对话
+_AMBIENT_APPS = (
+    (("chrome", "msedge", "firefox", "brave", "opera", "360se", "qqbrowser"), "逛网页"),
+    (("code", "pycharm", "idea", "devenv", "sublime", "webstorm", "goland", "trae"), "写代码"),
+    (("wechat", "weixin", "qq", "discord", "telegram", "lark", "feishu", "dingtalk"), "聊天"),
+    (("steam", "epicgames", "wegame", "genshin", "yuanshen", "starrail", "wuthering"), "玩游戏"),
+    (("potplayer", "vlc", "mpc-hc", "bilibili", "iqiyi", "youku"), "看视频"),
+    (("windowsterminal", "powershell", "cmd", "wt"), "用终端"),
+    (("excel", "winword", "powerpnt", "wps"), "写文档"),
+    (("explorer",), "翻文件"),
+)
+
+
+def _foreground_app_name() -> str:
+    """前台进程名（不含 .exe，小写）；取不到返回空串。"""
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        hwnd = int(user32.GetForegroundWindow())
+        if not hwnd:
+            return ""
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        handle = kernel32.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(512)
+            size = ctypes.c_ulong(512)
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return ""
+        finally:
+            kernel32.CloseHandle(handle)
+        return os.path.splitext(os.path.basename(buf.value))[0].lower()
+    except Exception:
+        return ""
+
+
+def _ambient_category(name: str) -> str:
+    """进程名 → 粗类别；认不出来就不报（宁可不说话，也不猜）。"""
+    name = (name or "").lower()
+    if not name or name in ("python", "pythonw"):
+        return ""
+    for keys, label in _AMBIENT_APPS:
+        if any(k == name or k in name for k in keys):
+            return label
+    return ""
+
+
 # 情绪标签 → 立绘状态（扩充词映射到现有立绘资产；Web 端另有 CSS 动画区分细腻情绪）
 class ChatController(QObject):
     """对话控制器：管理 LLM、语音合成、麦克风输入"""
@@ -362,6 +411,38 @@ class ChatController(QObject):
         except Exception:
             return 1.0
 
+    def _ambient_enabled(self) -> bool:
+        """环境感知开关（settings.json 的 ambient_awareness，默认关闭）。"""
+        try:
+            sp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+            with open(sp, encoding="utf-8") as f:
+                return bool(json.load(f).get("ambient_awareness", False))
+        except Exception:
+            return False
+
+    def _ambient_sample(self) -> str:
+        """采样前台应用类别，返回"连续用了多久"的提示；不满足条件返回空串。
+
+        只记录类别与起始时间，不记录窗口标题/文件名，也不落盘。
+        """
+        if not self._ambient_enabled():
+            self._ambient = {}
+            return ""
+        cat = _ambient_category(_foreground_app_name())
+        now = time.time()
+        a = getattr(self, "_ambient", None) or {}
+        if not cat:
+            self._ambient = {}
+            return ""
+        if a.get("cat") != cat:
+            a = {"cat": cat, "since": now}
+            self._ambient = a
+        mins = int((now - float(a.get("since") or now)) / 60)
+        if mins < 25:
+            return ""
+        return (f"用户已经在前台{cat}连续约 {mins} 分钟了。"
+                f"可以自然提一句关心（眼睛/休息之类），别像监控，也别报具体分钟数。")
+
     def _due_loop(self):
         """到期且还没追问过的未闭环话题（"明天面试"这类）；没有就返回 None。
 
@@ -405,6 +486,7 @@ class ChatController(QObject):
             if self._stream_active:
                 return
             now = time.time()
+            self._ambient_sample()  # 维护"连续使用同一类应用"的起点
             if now - self._last_user_activity < float(c["idle_min"]) * 60:
                 return
             if self._last_user_activity > float(getattr(self, "_proactive_mark", 0.0)):
@@ -514,6 +596,9 @@ class ChatController(QObject):
                 hook = llm.take_proactive_hook()
                 if hook:
                     hint += f"\n可接的话头（用户之前说过这句）：{hook}"
+            _amb = self._ambient_sample()
+            if _amb:
+                hint += "\n" + _amb
         except Exception:
             pass
         return hint

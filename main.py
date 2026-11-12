@@ -560,6 +560,13 @@ class TerminalApp(QObject):
                 "type": "bool",
                 "group": "运行",
             },
+            {
+                "label": "环境感知（只看前台应用类别，默认关闭）",
+                "key": "ambient_awareness",
+                "value": bool(self._settings.get("ambient_awareness", False)),
+                "type": "bool",
+                "group": "运行",
+            },
         ]
 
     def _bili_state_text(self) -> str:
@@ -592,6 +599,9 @@ class TerminalApp(QObject):
         elif key == "autostart":
             checked = value.lower() == "true"
             self._save_settings({"auto_start": checked})
+        elif key == "ambient_awareness":
+            # 环境感知：即时生效，chat_controller 每分钟重新读一次开关
+            self._save_settings({"ambient_awareness": value.lower() == "true"})
         elif key in ("cloud_api_key", "cloud_base_url", "cloud_model",
                       "llm_url", "llm_api_key"):
             # 模型配置项（通用云端 / 本地推理后端）：直接写 settings.json

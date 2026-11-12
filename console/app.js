@@ -178,6 +178,7 @@ function setupMockBridge() {
             ] },
             { label: "启用 NapCat（QQ 消息转发）", key: "napcat", value: false, type: "bool", group: "运行" },
             { label: "启动时自动检测并补齐服务", key: "autostart", value: true, type: "bool", group: "运行" },
+            { label: "环境感知（只看前台应用类别，默认关闭）", key: "ambient_awareness", value: false, type: "bool", group: "运行" },
         ])),
         get_weather: () => wrap("{}"),
         get_system_status: () => wrap("{}"),
