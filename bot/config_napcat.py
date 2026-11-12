@@ -43,6 +43,13 @@ else:
     LLM_MODEL = _SETTINGS_MODEL or "qwen2.5:7b"
 LLM_API_KEY  = _SETTINGS.get("cloud_api_key") or "ollama"   # 本地Ollama不需要真实Key
 LLM_BASE_URL = _SETTINGS.get("cloud_base_url") or "http://127.0.0.1:11434/api/chat"
+# 选了云端模型却没有 cloud_base_url 时，base 仍是 Ollama 地址，
+# 拼上 /chat/completions 必然 404 —— 这里直接回落到本地模型
+if LLM_MODEL.startswith(("agnes", "cloud:")) and not _SETTINGS.get("cloud_base_url"):
+    print("[配置] 选了云端模型但缺少 cloud_base_url，QQ 端回落到本地 qwen2.5:7b")
+    LLM_MODEL = "qwen2.5:7b"
+    LLM_API_KEY = "ollama"
+    LLM_BASE_URL = "http://127.0.0.1:11434/api/chat"
 LLM_API_URL = ""                       # 留空则使用默认地址
 # ---- 回复频率控制（防封号）----
 REPLY_PROBABILITY_GROUP = 0.3           # 群聊回复概率 30%（10条消息回3条）

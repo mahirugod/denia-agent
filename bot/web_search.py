@@ -282,6 +282,35 @@ def game_search_hint(topic: str) -> str:
     return _GAME_EN.get(topic or "", "")
 
 
+# 阵营/地名/系统名这类专有词单独检索会被拆成普通词义（"整合运动"→"整合"的词典解释），
+# 先补上所属游戏名再检索。只收指向唯一的词，宁可少收也别乱挂。
+_GAME_ALIASES = {
+    "整合运动": "明日方舟",
+    "罗德岛": "明日方舟",
+    "源石": "明日方舟",
+    "声骸": "鸣潮",
+    "今州": "鸣潮",
+    "邦布": "绝区零",
+    "新艾利都": "绝区零",
+    "星核": "崩坏：星穹铁道",
+    "匹诺康尼": "崩坏：星穹铁道",
+    "提瓦特": "原神",
+    "尘歌壶": "原神",
+    "沙勒": "蔚蓝档案",
+}
+
+
+def expand_game_alias(query: str) -> str:
+    """query 里出现专有词且没带游戏名时，补上所属游戏名；否则原样返回"""
+    q = query or ""
+    if not q or any(g in q for g in _GAME_NAMES):
+        return q
+    for alias, game in _GAME_ALIASES.items():
+        if alias in q:
+            return f"{game} {q}"
+    return q
+
+
 def is_game_news_query(text: str) -> bool:
     """判断 query 是否为游戏资讯类（游戏名 + 资讯关键词）"""
     if not text:
@@ -1421,6 +1450,11 @@ def search_multi(query: str, timeout: int = 6) -> Optional[str]:
     _t = time.time()
     from concurrent.futures import ThreadPoolExecutor
 
+    _expanded = expand_game_alias(query)
+    if _expanded != query:
+        print(f"[搜索] 专名补游戏名: '{query}' → '{_expanded}'")
+        query = _expanded
+
     _official_q = ""
     if not any(k in query for k in ("官方", "官网", "公告")):
         _official_q = f"{query} 官网 公告"
@@ -1674,6 +1708,8 @@ def _new_page():
     # 阻止图片加载加速搜索
     ctx.route('**/*.{png,jpg,jpeg,gif,svg,webp,ico}', lambda route: route.abort())
     page = ctx.new_page()
+    # 页面关闭时一并释放 context，否则每次搜索都会累积一个常驻浏览器上下文
+    page.on('close', lambda: ctx.close())
     # 反检测：覆盖 navigator.webdriver 等自动化标志
     page.add_init_script(
         "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
@@ -2023,6 +2059,7 @@ def search_and_summarize(query: str, deep: bool = None, retry_count: int = 0) ->
     Returns:
         格式化的搜索结果文本
     """
+    query = expand_game_alias(query)
     task = _submit_task("search", query=query, deep=deep)
     return task.get("result")
 

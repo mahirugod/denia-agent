@@ -1621,12 +1621,12 @@ function refreshServices() {
                 : s.state === 'failed' ? '重试' : '启动';
             item.innerHTML = `
                 <div class="svc-info">
-                    <span class="svc-name">${s.display}</span>
-                    ${s.note ? `<span class="svc-note">${s.note}</span>` : ''}
+                    <span class="svc-name">${_escapeHTML(s.display)}</span>
+                    ${s.note ? `<span class="svc-note">${_escapeHTML(s.note)}</span>` : ''}
                 </div>
                 <div class="svc-actions">
-                    <span class="svc-status ${stateClass}">${stateText}</span>
-                    <button class="svc-btn" data-name="${s.name}" data-action="${s.state === 'running' ? 'stop' : 'start'}"
+                    <span class="svc-status ${stateClass}">${_escapeHTML(stateText)}</span>
+                    <button class="svc-btn" data-name="${_escapeHTML(s.name)}" data-action="${s.state === 'running' ? 'stop' : 'start'}"
                         ${s.state === 'starting' ? 'disabled' : ''}>${btnLabel}</button>
                 </div>`;
             container.appendChild(item);

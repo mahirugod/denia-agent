@@ -46,3 +46,6 @@ node-runtime/
 .trae-html-share-packages/
 .screenshots/
 *.lnk
+
+# 临时验证/抓取产物
+_tmp_cache/

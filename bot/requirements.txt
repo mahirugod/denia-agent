@@ -1,9 +1,16 @@
-flask>=2.0.0
-requests>=2.25.0
-websockets>=10.0
-beautifulsoup4>=4.9.0
-lxml>=4.6.0
-yt-dlp>=2023.0.0
-selenium>=4.0.0
-Pillow>=8.0.0
+# ---- 桌面端 / 服务端核心 ----
+PySide6>=6.6,<7.0
+flask>=2.0,<4.0
+requests>=2.25,<3.0
+websockets>=10.0,<16.0
+beautifulsoup4>=4.9,<5.0
+lxml>=4.6,<7.0
+Pillow>=8.0,<12.0
 playsound>=1.3.0
+# ---- 检索 / 抓取 ----
+playwright>=1.40,<2.0
+selenium>=4.0,<5.0
+yt-dlp>=2023.0.0
+# ---- 记忆检索（dense_retrieval / memory_* 里按需 import）----
+numpy>=1.24,<3.0
+fastembed>=0.3,<1.0

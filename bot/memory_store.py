@@ -16,6 +16,7 @@ import re
 import threading
 import time
 import hashlib
+import shutil
 
 try:
     import dense_retrieval
@@ -33,6 +34,7 @@ _building = {"on": False}
 # 情节文件与向量缓存都会被多线程碰（回复线程 + 空闲抽取 + 退出钩子）。
 # Windows 上 os.replace 撞上未关闭的读句柄会抛 PermissionError，所以统一串行化。
 _io_lock = threading.RLock()
+_corrupt_backed_up = False
 
 # 遗忘曲线：score = 重要度 * exp(-Δt / S)，S 随命中次数增长（间隔重复）
 _BASE_STABLE_DAYS = 7.0
@@ -76,16 +78,38 @@ def load_episodes() -> list:
     if not os.path.exists(_EPISODES):
         return []
     out = []
+    bad = 0
     try:
         with _io_lock:
             with open(_EPISODES, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line:
+                    if not line:
+                        continue
+                    try:
                         out.append(json.loads(line))
-    except Exception:
-        pass
+                    except (json.JSONDecodeError, ValueError):
+                        bad += 1
+    except OSError as e:
+        print(f"[记忆] 读取失败: {e}")
+        return out
+    if bad:
+        _backup_corrupt_episodes()
     return out
+
+
+def _backup_corrupt_episodes():
+    """遇到坏行时先留一份原文件，避免后续整表写回把坏行之后的记忆抹掉"""
+    global _corrupt_backed_up
+    if _corrupt_backed_up:
+        return
+    _corrupt_backed_up = True
+    try:
+        dst = f"{_EPISODES}.bad-{time.strftime('%Y%m%d-%H%M%S')}"
+        shutil.copy2(_EPISODES, dst)
+        print(f"[记忆] 有损坏行被跳过，原文件已备份为 {os.path.basename(dst)}")
+    except OSError as e:
+        print(f"[记忆] 备份损坏文件失败: {e}")
 
 
 def _save_episodes(eps: list):
