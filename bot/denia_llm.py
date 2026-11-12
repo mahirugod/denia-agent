@@ -162,6 +162,10 @@ print(f"[denia_llm] build {_BUILD_TAG}")
 _STYLE_MARK_BEGIN = "【达妮娅台词样本·开始】"
 _STYLE_MARK_END = "【达妮娅台词样本·结束】"
 
+# 慢工具：执行前先垫一句极短的反应，避免界面/语音空等 2-3 秒
+_SLOW_TOOLS = {"web_search", "browse_url", "image_search", "screen_context", "bilibili_feed"}
+_TOOL_FILLERS = ("我查一下。", "等我一下，我看看。", "稍等，我搜搜看。", "我找找。")
+
 
 def _metric_bump(kind: str):
     try:
@@ -2024,10 +2028,15 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
             # 摘要硬上限 120 字（user+assistant 后内容变多，放宽上限）
             if len(self._rolling_summary) > 120:
                 self._rolling_summary = self._rolling_summary[-120:]
+        # 摘要压走的那段里，顺带把稳定事实（称呼/偏好/最近在做的事）抽出来：
+        # 会话摘要负责压上下文，实体负责长期检索，两者在同一处维护才不会脱节
+        for m in oldest:
+            if m.get("role") == "user":
+                self._extract_entities(m.get("content", ""))
         self._rolling_count = 0
 
     def _extract_entities(self, user_text: str):
-        """C：纯规则抽取关键实体（人名/称呼/游戏/地名/歌曲影视/时间），不耗模型，
+        """C：纯规则抽取稳定事实（称呼/偏好/正在做的事/地名/时间），不耗模型，
         存入 _mem_entities（去重，最多 12 条，FIFO）。"""
         import re as _re
 
@@ -2036,6 +2045,15 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         m = _re.search(r"我(?:叫|是)([\u4e00-\u9fa5]{2,4})", text)
         if m:
             self._mem_entities.setdefault("我的称呼", m.group(1))
+        # 偏好：「我喜欢X」「我不喜欢X」「我讨厌X」——否定式要单独记，别归一成喜欢
+        m = _re.search(r"我(?:最|很|超|挺)?(不喜欢|讨厌|喜欢|爱|偏爱)([\u4e00-\u9fa5\w]{2,10})", text)
+        if m:
+            key = "我不喜欢" if m.group(1) in ("不喜欢", "讨厌") else "我喜欢"
+            self._mem_entities.setdefault(key, m.group(2))
+        # 正在做的事：「我最近在X」「我现在在X」「我这几天在忙X」
+        m = _re.search(r"我(?:最近|现在|这几天|这阵子)(?:正在|在|忙着|都在)?([\u4e00-\u9fa5\w]{2,12})", text)
+        if m:
+            self._mem_entities.setdefault("我最近", m.group(1))
         # 游戏名（小模型易错，固定词表）
         for g in ["鸣潮", "原神", "崩坏", "崩铁", "星穹", "王者荣耀", "明日方舟", "库洛"]:
             if g in text or g in text.replace("庫", "库").replace("潮", "潮"):
@@ -2054,11 +2072,12 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
             self._mem_entities["待办"] = f"{m.group(1)}{m.group(2)}提醒{m.group(3)}"
         # FIFO：超过 12 条丢最旧的
         if len(self._mem_entities) > 12:
-            # 保留"我的称呼/我在玩/待办"优先，丢其余最早插入的
+            # 保留"稳定事实"优先，丢其余最早插入的
+            _keep = ("我的称呼", "我在玩", "待办", "我喜欢", "我不喜欢", "我最近")
             for k in list(self._mem_entities.keys()):
                 if len(self._mem_entities) <= 12:
                     break
-                if k not in ("我的称呼", "我在玩", "待办"):
+                if k not in _keep:
                     self._mem_entities.pop(k, None)
 
     def _get_memory_injection(self) -> str:
@@ -2067,8 +2086,8 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         if self._rolling_summary:
             seg.append(self._rolling_summary)
         if self._mem_entities:
-            # 只取前 3 条最关键的（优先称呼/游戏/待办）
-            prio = ["我的称呼", "我在玩", "待办"]
+            # 只取前 3 条最关键的（优先称呼/偏好/在玩/待办）
+            prio = ["我的称呼", "我喜欢", "我不喜欢", "我最近", "我在玩", "待办"]
             picked = []
             for p in prio:
                 if p in self._mem_entities:
@@ -2102,7 +2121,8 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         _st = {}
         try:
             _mood = self._mood if _setting_bool("mood_enabled", True) else 0
-            hits = _ms.recall(user_input, k=4, mood=_mood, stats=_st)
+            hits = _ms.recall(user_input, k=4, mood=_mood, stats=_st,
+                              focus=list((getattr(self, "_mem_entities", {}) or {}).values()))
             if _st.get("boosted") or _st.get("suppressed"):
                 print(f"[记忆] 召回 {_st.get('count', 0)} 条（情绪加权 "
                       f"+{_st.get('boosted', 0)}/-{_st.get('suppressed', 0)}）")
@@ -3685,6 +3705,23 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                 "tool_call_id": call.get("id") or "call_0",
                 "content": text}
 
+    def _maybe_tool_filler(self, on_delta, on_sentence):
+        """慢工具/预搜索开始前垫一句极短的反应（每轮最多一次）。
+
+        语音端必须"先垫话再补结果"，文字端同样收益：界面不会空等 2-3 秒。
+        已经说过话的轮次不再垫，避免把正文截成两段。
+        """
+        if getattr(self, "_filler_emitted", False) or getattr(self, "_turn_spoken", False):
+            return
+        self._filler_emitted = True
+        line = random.choice(_TOOL_FILLERS)
+        for _cb in (on_delta, on_sentence):
+            if _cb:
+                try:
+                    _cb(line)
+                except Exception:
+                    pass
+
     def _run_tool_loop(self, messages, user_input, on_sentence, on_delta, schemas, streamer):
         """多步工具循环（任务模式）：模型可连续调用工具，直到给出无工具的最终回复。
 
@@ -3828,6 +3865,10 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                       f"{'有结果' if ctx else '无结果'}")
                 return self._tool_msg(
                     c, ctx or f"（系统：{info.name} 没有返回内容，换个关键词或同类工具再试一次，别直接放弃）")
+
+            # 慢工具：先垫一句再执行，避免界面/语音空等几秒
+            if any((c.get("name") or "") in _SLOW_TOOLS for c in calls):
+                self._maybe_tool_filler(on_delta, on_sentence)
 
             # 同一轮多个只读工具并发执行，省掉逐个排队等待；有副作用的工具仍串行
             if len(calls) > 1 and all(
@@ -4454,6 +4495,7 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
             def on_delta(d):  # noqa: F811
                 if d:
                     _emitted_parts.append(d)
+                    self._turn_spoken = True
                 _emit_delta(d)
         if _emit_sentence is not None:
             def on_sentence(seg):  # noqa: F811
@@ -4461,11 +4503,15 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                 if hits:
                     _metric_bump("lore_leak")
                 if clean.strip():
+                    self._turn_spoken = True
                     # 没有增量回调（如 QQ 渠道）时用分句累计，避免重复计数
                     if _emit_delta is None:
                         _emitted_parts.append(clean)
                     _emit_sentence(clean)
         self.last_thinking = ""  # 重置思考链（每轮新对话清空）
+        # 工具垫话状态：每轮重置，保证慢工具前最多垫一句、说过话后不再垫
+        self._filler_emitted = False
+        self._turn_spoken = False
 
         # 与 get_response 相同的前置处理
         self._is_personal_question = self._is_dania_personal_question(user_input)
@@ -4646,6 +4692,10 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         if (_info is not None and not _guard_denied and not _demote_rules
                 and _info.name == "screen_context"):
             _inline = ("screen", lambda: self._screen_capture_context(_normalized_input))
+        if (_search_task is not None or _weather_tool is not None
+                or _inline is not None):
+            # 预搜索/天气会先阻塞几秒才开始流式：先垫一句，别让界面和语音空等
+            self._maybe_tool_filler(on_delta, on_sentence)
         _pre = _parallel_fetch(_pre_tasks, _SEARCH_DEADLINE, inline=_inline)
 
         # 规则命中的工具留作兜底候选（护栏拒绝的不算）

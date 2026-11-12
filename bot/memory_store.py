@@ -289,11 +289,15 @@ def _build_vectors(eps: list, digest: str):
         _building["on"] = False
 
 
-def recall(query: str, k: int = 4, mood: float = 0, stats: dict = None) -> list:
+def recall(query: str, k: int = 4, mood: float = 0, stats: dict = None,
+           focus: list = None) -> list:
     """按当前这句话召回相关情节；命中会累加 hits（影响后续遗忘速度）。
 
     mood 是当前心情分数（-10~10）：情绪一致的旧事更容易被想起，
     反向情绪的记忆会被压一点。0 表示中性，不做加权。
+    focus 是当前会话的稳定事实词（称呼/偏好/在玩的东西）：先用它把候选情节
+    缩到同一实体上，再算相似度，避免每次召回都被无关旧事占满上下文；
+    候选不够 k 条时退回全量，保证召回不会因为实体太少而落空。
     """
     with _io_lock:  # 读-改-写要串行，否则并发召回会互相覆盖 hits
         all_eps = load_episodes()
@@ -315,6 +319,19 @@ def recall(query: str, k: int = 4, mood: float = 0, stats: dict = None) -> list:
             mixed = [s * b for s, b in zip(mixed, boosts)]
         else:
             boosts = [1.0] * len(eps)
+        # 实体过滤：候选够 k 条就只在这些情节里排，避免无关旧事挤占上下文
+        if focus:
+            terms = {str(t).strip() for t in focus if len(str(t or "").strip()) >= 2}
+            if terms:
+                cand = [i for i, ep in enumerate(eps)
+                        if any(t in (ep.get("text") or "") for t in terms)]
+                if len(cand) >= k and len(cand) < len(eps):
+                    allowed = set(cand)
+                    masked = [s if i in allowed else 0.0 for i, s in enumerate(mixed)]
+                    if any(masked):
+                        mixed = masked
+                        if isinstance(stats, dict):
+                            stats["entity_filter"] = len(eps) - len(cand)
         order = sorted(range(len(eps)), key=lambda i: mixed[i], reverse=True)[:k]
         out = []
         for i in order:
