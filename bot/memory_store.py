@@ -47,6 +47,220 @@ def _ensure_dir():
     os.makedirs(_SUMMARY_DIR, exist_ok=True)
 
 
+# ── 禁提指令（"以后别再问工作的事了"）──
+# 用户明确说过不想聊的话题。和事实记忆分开存：这不是"她记得的事"，
+# 而是"她被告知别做的事"，绝不能当成情节注入。
+# TTL = 3 天 × 被重申次数，上限 30 天：提一次管三天，反复提才长期生效。
+_DIRECTIVES = os.path.join(_DIR, "directives.json")
+_DIRECTIVE_BASE_DAYS = 3.0
+_DIRECTIVE_MAX_DAYS = 30.0
+_BAN_STOP = {"这个", "那个", "这事", "那事", "这些", "那些", "它", "他", "她",
+             "这个了", "这种话", "这类话", "那种话", "玩笑", "废话"}
+
+
+def _load_directives(now: float = None) -> list:
+    now = now or time.time()
+    if not os.path.exists(_DIRECTIVES):
+        return []
+    try:
+        with _io_lock:
+            with open(_DIRECTIVES, "r", encoding="utf-8") as f:
+                items = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(items, list):
+        return []
+    return [d for d in items if float(d.get("expires") or 0) > now]
+
+
+def _save_directives(items: list):
+    _ensure_dir()
+    tmp = _DIRECTIVES + ".tmp"
+    with _io_lock:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+        os.replace(tmp, _DIRECTIVES)
+
+
+def add_directive(term: str, kind: str = "ban_topic") -> dict:
+    """记一条禁提指令；同一话题再次提到则续期（TTL 随命中次数增长）。"""
+    term = re.sub(r"[\s，。！？、,.!?\"'“”‘’]+", "", str(term or ""))[:12]
+    if len(term) < 2 or term in _BAN_STOP:
+        return {}
+    now = time.time()
+    with _io_lock:
+        items = _load_directives(now)
+        for d in items:
+            if d.get("kind") == kind and d.get("term") == term:
+                hits = int(d.get("hits") or 1) + 1
+                days = min(_DIRECTIVE_BASE_DAYS * hits, _DIRECTIVE_MAX_DAYS)
+                d["hits"] = hits
+                d["last_hit"] = round(now, 3)
+                d["expires"] = round(now + days * 86400, 3)
+                _save_directives(items)
+                return d
+        d = {"term": term, "kind": kind, "created": round(now, 3),
+             "last_hit": round(now, 3), "hits": 1,
+             "expires": round(now + _DIRECTIVE_BASE_DAYS * 86400, 3)}
+        items.append(d)
+        _save_directives(items)
+        return d
+
+
+def _banned_terms(now: float = None) -> list:
+    return [d.get("term", "") for d in _load_directives(now)
+            if d.get("kind") == "ban_topic" and d.get("term")]
+
+
+def banned_terms(now: float = None) -> list:
+    """当前生效的禁提话题（记忆页/调试用）。"""
+    return _banned_terms(now)
+
+
+def match_directive(text: str) -> str:
+    """文本命中了哪个禁提话题；没命中返回空串。主动搭话的硬闸门用它。"""
+    t = text or ""
+    for term in _banned_terms():
+        if term in t:
+            return term
+    return ""
+
+
+def directives_block() -> str:
+    """注入 prompt 的禁提约束；没有指令返回空串。"""
+    terms = _banned_terms()
+    if not terms:
+        return ""
+    return ("【不要主动提的话题】用户明确说过不想聊：" + "、".join(terms)
+            + "。别主动问、别主动提；只有用户自己先说起，才可以接话。")
+
+
+def disputes(ep: dict, now: float = None) -> float:
+    """有效异议强度：被否认的次数按 90 天半衰，越近越重。
+
+    和 hits（被想起的次数）刻意用不同的时钟：被想起不等于被确认，
+    被否认过的事则要记更久。
+    """
+    n = int(ep.get("disputes") or 0)
+    if n <= 0:
+        return 0.0
+    now = now or time.time()
+    days = max(0.0, (now - float(ep.get("last_dispute_ts") or 0)) / 86400.0)
+    return n * pow(2.718281828, -days / 90.0)
+
+
+def mark_disputed(ep_id: str) -> bool:
+    """用户否认了某条记忆：异议计数 +1，并刷新时间戳（不删，保留可审计）。"""
+    if not ep_id:
+        return False
+    with _io_lock:
+        eps = load_episodes()
+        hit = False
+        for ep in eps:
+            if ep.get("id") == ep_id:
+                ep["disputes"] = int(ep.get("disputes") or 0) + 1
+                ep["last_dispute_ts"] = round(time.time(), 3)
+                hit = True
+        if hit:
+            _save_episodes(eps)
+        return hit
+
+
+# ── 作息节律（用户大概几点醒着）──
+# 主动搭话的固定 DND 窗口是拍脑袋的 23:00-08:00，作息不同的人会一直被吵醒或被错过。
+# 这里只记"哪个小时有动静"，不记内容；样本按 45 天半衰，换作息后会慢慢跟上。
+_RHYTHM = os.path.join(_DIR, "rhythm.json")
+_RHYTHM_SAMPLE_GAP = 900      # 同一时段 15 分钟只记一次，避免刷屏把样本拉偏
+_RHYTHM_MIN_SAMPLES = 20
+_RHYTHM_HALF_DAYS = 45.0
+
+
+def _rhythm_load() -> dict:
+    try:
+        with _io_lock:
+            with open(_RHYTHM, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _rhythm_save(d: dict):
+    _ensure_dir()
+    tmp = _RHYTHM + ".tmp"
+    try:
+        with _io_lock:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False)
+            os.replace(tmp, _RHYTHM)
+    except OSError:
+        pass
+
+
+def _rhythm_decayed(d: dict, now: float) -> list:
+    """返回 24 个衰减后的活跃度计数。"""
+    hours = d.get("hours") if isinstance(d.get("hours"), dict) else {}
+    last = float(d.get("last_decay") or now)
+    factor = pow(2.718281828, -max(0.0, now - last) / (_RHYTHM_HALF_DAYS * 86400.0))
+    out = []
+    for h in range(24):
+        try:
+            out.append(float(hours.get(str(h), 0.0)) * factor)
+        except (TypeError, ValueError):
+            out.append(0.0)
+    return out
+
+
+def note_active_hour(hour: int = None):
+    """记一次"这个小时用户有动静"（用于估计作息，不保存任何内容）。"""
+    now = time.time()
+    if hour is None:
+        hour = time.localtime(now).tm_hour
+    d = _rhythm_load()
+    if now - float(d.get("last_sample") or 0) < _RHYTHM_SAMPLE_GAP:
+        return
+    counts = _rhythm_decayed(d, now)
+    counts[int(hour) % 24] += 1.0
+    _rhythm_save({
+        "hours": {str(i): round(v, 3) for i, v in enumerate(counts)},
+        "last_decay": round(now, 3),
+        "last_sample": round(now, 3),
+    })
+
+
+def _longest_run(active: set) -> list:
+    """连续小时段（支持跨零点），取最长的一段。"""
+    best = []
+    for start in sorted(active):
+        run, h = [], start
+        while h in active and len(run) < 24:
+            run.append(h)
+            h = (h + 1) % 24
+        if len(run) > len(best):
+            best = run
+    return best
+
+
+def rhythm_window(now: float = None) -> tuple:
+    """估计的 (起床小时, 睡觉小时)；样本不够或作息太散（几乎全天活跃）返回 (-1, -1)。
+
+    "睡觉小时"是最后一个活跃小时的下一个整点。
+    """
+    d = _rhythm_load()
+    counts = _rhythm_decayed(d, now or time.time())
+    total = sum(counts)
+    if total < _RHYTHM_MIN_SAMPLES:
+        return (-1, -1)
+    peak = max(counts)
+    if peak <= 0:
+        return (-1, -1)
+    active = {h for h, v in enumerate(counts) if v >= peak * 0.25}
+    run = _longest_run(active)
+    if len(run) < 4 or len(run) >= 20:  # 样本太散：作息不规律，不猜
+        return (-1, -1)
+    return (run[0], (run[-1] + 1) % 24)
+
+
 # ── 情节记忆 ──
 def _ep_id(text: str, ts: float) -> str:
     return hashlib.sha1(f"{ts}|{text}".encode("utf-8")).hexdigest()[:12]
@@ -222,7 +436,12 @@ def score(ep: dict, now: float = None) -> float:
     days = max(0.0, (now - float(ep.get("ts") or 0)) / 86400.0)
     imp = float(ep.get("importance") or 3)
     stable = _BASE_STABLE_DAYS * imp * (1.0 + float(ep.get("hits") or 0))
-    return imp * pow(2.718281828, -days / stable)
+    base = imp * pow(2.718281828, -days / stable)
+    # 被否认过的记忆衰减更快；异议比"没被想起"更该影响强度
+    d = disputes(ep, now)
+    if d:
+        base *= max(0.0, 1.0 - 0.45 * d)
+    return base
 
 
 # ── 会话摘要 ──
@@ -384,6 +603,28 @@ def recall(query: str, k: int = 4, mood: float = 0, stats: dict = None,
         eps = active_episodes(all_eps)
         # 待确认的改口记录不进普通召回（由主动搭话处理，别当成"用户说过"注入）
         eps = [e for e in eps if e.get("kind") != "confirm"]
+        # 禁提话题：用户说过不想聊的，连召回都不要翻出来（问"以前"时也不放行）
+        banned = _banned_terms()
+        if banned:
+            kept = []
+            for e in eps:
+                if any(t in (e.get("text") or "") for t in banned):
+                    if isinstance(stats, dict):
+                        stats["banned"] = stats.get("banned", 0) + 1
+                    continue
+                kept.append(e)
+            eps = kept
+        # 异议够重：排序前硬过滤（保留在库里可审计，不再当"事实"用）。
+        # 用衰减后的强度而不是原始次数：很久以前被否认过的事，随着时间推移可以重新回到候选。
+        _now = time.time()
+        kept = []
+        for e in eps:
+            if disputes(e, _now) >= 1.5 and not e.get("protected"):
+                if isinstance(stats, dict):
+                    stats["disputed"] = stats.get("disputed", 0) + 1
+                continue
+            kept.append(e)
+        eps = kept
         if _PAST_RE.search(query or ""):
             expired = [e for e in all_eps
                        if e.get("valid_to") and not e.get("merged_into")]
@@ -408,6 +649,9 @@ def recall(query: str, k: int = 4, mood: float = 0, stats: dict = None,
             mixed = [s * b for s, b in zip(mixed, boosts)]
         else:
             boosts = [1.0] * len(eps)
+        # 异议降权：被否认过一次的还留着，但排后面；两次以上已在上面过滤掉
+        mixed = [s * max(0.0, 1.0 - 0.45 * disputes(ep, _now))
+                 for s, ep in zip(mixed, eps)]
         # 实体过滤：候选够 k 条就只在这些情节里排，避免无关旧事挤占上下文
         if focus:
             terms = {str(t).strip() for t in focus if len(str(t or "").strip()) >= 2}

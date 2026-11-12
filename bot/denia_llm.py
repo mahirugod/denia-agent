@@ -90,6 +90,33 @@ _FOLLOWUP_MARK_RE = re.compile(
     r"^(?:那?个?呢|呢|继续|然后呢?|接着(?:说|讲)?|详细(?:说说|讲讲)?|再(?:说说|讲讲)|说说|讲讲)[？?]?$"
 )
 
+# 禁提指令："以后别再问工作的事了" → 抽话题词，交给 memory_store 存 TTL
+_DIRECTIVE_RE = re.compile(
+    r"(?:以后|今后|下次)?\s*(?:别再|不要再|不要|别|不用|不许)(?:再)?"
+    r"(?:问|提|说|聊|讲)(?:起|到)?(?:关于)?"
+    r"(?P<topic>[^，。！？!?、,.!?\s]{1,12}?)"
+    r"(?:的(?:事情|事|话题)|这个话题|这些|那些)?"
+    r"(?:了|吧|啊|哦|啦)?[。！？!?]?\s*$"
+)
+# 弱一点的表达："不想聊工作"
+_DIRECTIVE_RE2 = re.compile(
+    r"(?:不想|不愿意|不太想)(?:再)?(?:聊|提|说)(?:起)?(?:关于)?"
+    r"(?P<topic>[^，。！？!?、,.!?\s]{2,12}?)(?:了|吧|啊|哦)?[。！？!?]?\s*$"
+)
+
+# 情绪二阶惯性：把 mood 当成"有速度的弹簧"，事件给一个冲量，之后带阻尼回弹。
+# 一阶衰减（mood * 0.85 + delta）掉得太干净，没有"余怒/余喜"；
+# 弹簧会轻微冲过头再回来，更像人的情绪曲线。
+_MOOD_SPRING_K = 0.08
+_MOOD_SPRING_DAMP = 0.35
+_MOOD_MAX_VEL = 1.2
+
+# 用户否认上一轮召回的记忆（"我没说过"/"你记错了"）→ 给那条记忆记一次异议
+_DENIAL_RE = re.compile(
+    r"我没(?:有)?说(?:过)?|不是我这个?意思|不是这样|不是这个吧|你记错|你记混|记错了|"
+    r"你搞错|搞错了|没这回事|哪有这(?:事|回事)|你编的|别瞎编|胡说"
+)
+
 
 def cleanup_stale_history(active_file: str = ""):
     """归档长期未使用的会话历史（每个进程只跑一次）
@@ -1321,6 +1348,7 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
 
         # 长期记忆：本轮注入块 / 会话缓冲 / 空闲落盘定时器
         self._pending_memory_block = ""
+        self._last_recall_ids = []  # 上一轮召回的记忆 id（用户否认时记异议）
         self._mem_pending = []
         self._mem_timer = None
         self._mem_lock = threading.Lock()
@@ -1774,11 +1802,17 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
     def _load_mood(self) -> float:
         """读分数，并按离线时长向平静回落（离开越久越淡）"""
         self._energy = 70.0
+        self._mood_vel = 0.0
         try:
             with open(self._mood_file, encoding="utf-8") as f:
                 d = json.load(f)
             score = max(-10.0, min(10.0, float(d.get("score", 0.0))))
             self._mood_reason = str(d.get("reason") or "")
+            try:
+                # 离线时间已经把情绪拉回平静了，动量一并清掉，免得一上线就抖
+                self._mood_vel = max(-_MOOD_MAX_VEL, min(_MOOD_MAX_VEL, float(d.get("vel", 0.0))))
+            except (TypeError, ValueError):
+                self._mood_vel = 0.0
             try:
                 self._energy = max(5.0, min(100.0, float(d.get("energy", 70.0))))
             except Exception:
@@ -1805,6 +1839,7 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"score": round(self._mood, 1),
                            "reason": self._mood_reason,
+                           "vel": round(float(getattr(self, "_mood_vel", 0.0)), 3),
                            "energy": round(float(getattr(self, "_energy", 70.0)), 1),
                            "updated": round(time.time(), 3)},
                           f, ensure_ascii=False)
@@ -2015,6 +2050,9 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         if not d:
             return
         self._mood = max(-10.0, min(10.0, self._mood + d))
+        # 同向动量：事件不是瞬间到位，而是先冲过头再回落
+        self._mood_vel = max(-_MOOD_MAX_VEL, min(_MOOD_MAX_VEL,
+                                                 float(getattr(self, "_mood_vel", 0.0)) + d * 0.3))
         self._mood_reason = reason or self._MOOD_REASON.get(kind, "")
         self._save_mood()
 
@@ -2044,7 +2082,19 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         self._mood_last_text = reply_text
         tags = re.findall(r"\[情绪[:：]([\w\u4e00-\u9fff]+)\]", reply_text)
         delta = max((self._MOOD_DELTA.get(t, 0.0) for t in tags), default=0.0)
-        self._mood = max(-10.0, min(10.0, self._mood * 0.85 + delta))
+        vel = float(getattr(self, "_mood_vel", 0.0))
+        if delta:
+            vel += delta * 0.35
+        # 二阶回落：弹簧力把它拉回平静，阻尼让速度慢慢耗掉。会轻微冲过头再回来。
+        accel = -_MOOD_SPRING_K * self._mood - _MOOD_SPRING_DAMP * vel
+        vel = max(-_MOOD_MAX_VEL, min(_MOOD_MAX_VEL, vel + accel))
+        self._mood = max(-10.0, min(10.0, self._mood + vel))
+        # 撞到 ±10 的边界就吃掉动量，否则会在边界上反复弹；足够接近平静时直接归零
+        if abs(self._mood) >= 10.0 or (abs(self._mood) < 0.05 and abs(vel) < 0.02):
+            vel = 0.0
+            if abs(self._mood) < 0.05:
+                self._mood = 0.0
+        self._mood_vel = vel
         self._save_mood()
 
     def _history_budget(self) -> int:
@@ -2180,6 +2230,44 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         "聚餐", "旅行", "上课", "上班", "开会", "参加", "上线", "开服",
         "发布", "更新", "截止", "交稿", "发货", "到货", "开庭", "报到",
     )
+
+    def _extract_directive(self, text: str):
+        """用户说"以后别再问X了"→ 存一条带 TTL 的禁提指令。
+
+        只抽话题词，不存整句：整句带着"以后/了"这些成分，拿去匹配旧记忆会永远匹配不上。
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        m = _DIRECTIVE_RE.search(text) or _DIRECTIVE_RE2.search(text)
+        if not m:
+            return
+        topic = re.sub(r"^(?:关于|那个|这个)", "",
+                       (m.group("topic") or "").strip()).strip()
+        if len(topic) < 2:
+            return
+        try:
+            import memory_store as _ms
+            d = _ms.add_directive(topic)
+            if d:
+                days = max(1, int((float(d.get("expires") or 0) - time.time()) / 86400))
+                print(f"[记忆] 禁提话题：{topic}（第 {d.get('hits')} 次，{days} 天内有效）")
+        except Exception:
+            pass
+
+    def _maybe_mark_dispute(self, text: str):
+        """用户否认上一轮召回的事实 → 给那条记忆记一次异议（降权，不删除）。"""
+        if not _DENIAL_RE.search(text or ""):
+            return
+        ids = list(getattr(self, "_last_recall_ids", []) or [])
+        if not ids:
+            return
+        try:
+            import memory_store as _ms
+            if _ms.mark_disputed(ids[0]):
+                print(f"[记忆] 用户否认，异议 +1：{ids[0]}")
+        except Exception:
+            pass
 
     def _extract_open_loop(self, text: str):
         """把"明天面试"这类未来事件存成到点会被追问的未闭环话题。
@@ -2360,9 +2448,12 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
             hits = _ms.recall(user_input, k=int(getattr(self, "_recall_k", 4) or 4),
                               mood=_mood, stats=_st,
                               focus=list((getattr(self, "_mem_entities", {}) or {}).values()))
-            if _st.get("boosted") or _st.get("suppressed"):
+            # 留给下一轮判断"用户是不是在否认这条记忆"（异议计数用）
+            self._last_recall_ids = [h.get("id") for h in hits if h.get("id")]
+            if _st.get("boosted") or _st.get("suppressed") or _st.get("banned"):
                 print(f"[记忆] 召回 {_st.get('count', 0)} 条（情绪加权 "
-                      f"+{_st.get('boosted', 0)}/-{_st.get('suppressed', 0)}）")
+                      f"+{_st.get('boosted', 0)}/-{_st.get('suppressed', 0)}，"
+                      f"禁提跳过 {_st.get('banned', 0)}）")
         except Exception as _e:
             print(f"[记忆] 召回失败（忽略）: {str(_e)[:60]}")
             hits = []
@@ -2370,12 +2461,20 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
             summary = _ms.read_summary(self._memory_key(), 360)
         except Exception:
             summary = ""
-        if not hits and not summary:
+        # 禁提约束放在最前：即使本轮没召回任何旧事也要进 prompt，且不会被后面的长度截断吃掉
+        try:
+            _dir_block = _ms.directives_block()
+        except Exception:
+            _dir_block = ""
+        if not hits and not summary and not _dir_block:
             return ""
-        parts = [
+        parts = []
+        if _dir_block:
+            parts.append(_dir_block)
+        parts.append(
             "【你还记得的事】（这些是用户亲口说过的，不是设定、不是剧情。"
             "聊天里自然提到就行，别列成清单，别当成别人的故事）"
-        ]
+        )
         for h in hits:
             _past = "（以前的说法，现在可能已经改了）" if h.get("valid_to") else ""
             parts.append(f"- {h.get('date', '')} {_past}{h.get('text', '')}")
@@ -3035,6 +3134,14 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         )
         if hint:
             persona += f"\n【当下状态】{hint}"
+        # 用户明确禁提的话题：主动搭话是最容易踩雷的入口，约束必须带进来
+        try:
+            import memory_store as _ms
+            _dir = _ms.directives_block()
+            if _dir:
+                persona += "\n" + _dir
+        except Exception:
+            pass
         messages = [{"role": "system", "content": persona}]
         for m in (history or [])[-6:]:
             role = m.get("role")
@@ -4732,6 +4839,8 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         self._refresh_style_anchor(user_input)  # 按这句话挑台词组（失败保持原样本）
         self._bump_relationship(user_input)  # 跨会话熟悉度：她和你越来越熟
         self._extract_open_loop(user_input)  # "明天面试"这种未来事件，到点会追问
+        self._maybe_mark_dispute(user_input)  # 用户否认上一轮召回 → 异议计数
+        self._extract_directive(user_input)  # "别再问X了" → 禁提指令
         self._pending_memory_block = self._long_memory_block(user_input)  # 召回旧事
 
         # 每轮都显式赋值：上一轮的图片描述不能泄漏到本轮纯文本对话
@@ -5446,6 +5555,8 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         self._refresh_style_anchor(user_input)  # 按这句话挑台词组（失败保持原样本）
         self._bump_relationship(user_input)  # 跨会话熟悉度
         self._extract_open_loop(user_input)  # 未来事件 → 到点追问
+        self._maybe_mark_dispute(user_input)  # 否认上一轮召回 → 异议计数
+        self._extract_directive(user_input)  # "别再问X了" → 禁提指令
         self._pending_memory_block = self._long_memory_block(user_input)  # 召回旧事
 
         # 工具路由：命中关键词则执行工具，结果作为上下文注入（由 LLM 以人设转述）

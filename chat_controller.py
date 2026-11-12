@@ -164,6 +164,8 @@ class ChatController(QObject):
         self._last_proactive_ts = 0.0
         self._proactive_used = deque(maxlen=4)
         self._proactive_miss = 0      # 连续几次主动搭话没被回应
+        self._proactive_day = ""      # 每日预算按自然日重置
+        self._proactive_today = 0
         self._proactive_mark = 0.0    # 上次重置时的用户活动时间
         self._stream_active = False
         # 消息串行队列：连发多条时严格按顺序逐条处理，避免前一条回复被后一条顶掉
@@ -374,6 +376,8 @@ class ChatController(QObject):
             "idle_min": 10.0,       # 用户至少安静这么久才搭话
             "dnd_start": "23:00",   # 不打扰时段（跨零点也支持）
             "dnd_end": "08:00",
+            "daily_max": 5,         # 每天主动开口的上限（含没人理的）
+            "rhythm": True,         # 用观测到的作息兜住固定 DND 窗口
         }
         try:
             _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
@@ -392,6 +396,11 @@ class ChatController(QObject):
             # 单独的开合开关（不在上面按前缀批量映射，免得键名对不上）
             cfg["backoff"] = bool(s.get("proactive_backoff_enabled", True))
             cfg["hooks"] = bool(s.get("proactive_hooks_enabled", True))
+            try:
+                cfg["daily_max"] = max(1, int(s.get("proactive_daily_max", cfg["daily_max"])))
+            except (TypeError, ValueError):
+                pass
+            cfg["rhythm"] = bool(s.get("proactive_rhythm_enabled", True))
         except Exception:
             pass
         return cfg
@@ -463,25 +472,45 @@ class ChatController(QObject):
             return None
 
     def _in_dnd(self) -> bool:
-        """当前是否处于不打扰时段（支持 23:00-08:00 跨零点）"""
+        """当前是否处于不打扰时段：固定窗口 + 观测到的作息窗口。
+
+        固定 23:00-08:00 是拍脑袋的，作息不同的人会一直被吵醒或被错过。
+        这里再用"用户平时几点有动静"兜一层，样本不够时不生效（返回 False，
+        和以前行为一致）。
+        """
         try:
             def _m(t):
                 h, m = str(t).split(":")[:2]
                 return int(h) * 60 + int(m)
             s, e = _m(self._proactive_cfg["dnd_start"]), _m(self._proactive_cfg["dnd_end"])
-            if s == e:
-                return False
             now = time.localtime()
             cur = now.tm_hour * 60 + now.tm_min
-            return (s <= cur < e) if s < e else (cur >= s or cur < e)
+            if s != e and ((s <= cur < e) if s < e else (cur >= s or cur < e)):
+                return True
+            if self._proactive_cfg.get("rhythm", True):
+                import memory_store
+                wake, bed = memory_store.rhythm_window()
+                if wake >= 0:
+                    h = now.tm_hour
+                    awake = (wake <= h < bed) if wake <= bed else (h >= wake or h < bed)
+                    if not awake:
+                        return True
         except Exception:
             return False
+        return False
 
     def _proactive_tick(self):
         """每分钟检查一次是否该主动搭话"""
         try:
             c = self._proactive_cfg
             if not c.get("enabled", True):
+                return
+            # 每日预算：按自然日重置。没人理的也算一次，免得冷场时越试越勤
+            _today = time.strftime("%Y-%m-%d")
+            if self._proactive_day != _today:
+                self._proactive_day = _today
+                self._proactive_today = 0
+            if self._proactive_today >= int(c.get("daily_max", 5) or 5):
                 return
             if self._stream_active:
                 return
@@ -544,6 +573,7 @@ class ChatController(QObject):
                 except Exception:
                     pass
             self._last_proactive_ts = now
+            self._proactive_today += 1
             self._proactive_miss = _miss + 1
             self._stream_active = True
             threading.Thread(target=self._proactive_locked,
@@ -551,24 +581,61 @@ class ChatController(QObject):
         except Exception as e:
             self.log.emit(f"⚠️ 主动话题调度异常: {e}")
 
+    def _proactive_mode(self) -> str:
+        """主动开口的档位：'brief' 只应一声 / 'full' 正常开个话题。
+
+        用户在写代码写文档，或者她精力见底时，完整开新话题很打扰；
+        给一个短反应更接近"在场"，而不是"抢话"。
+        """
+        try:
+            llm = getattr(getattr(self, "_bot", None), "llm", None)
+            if llm is not None and float(getattr(llm, "_energy", 70.0)) < 25.0:
+                return "brief"
+        except Exception:
+            pass
+        a = getattr(self, "_ambient", None) or {}
+        if a.get("cat") in ("写代码", "写文档"):
+            if time.time() - float(a.get("since") or 0) >= 25 * 60:
+                return "brief"
+        return "full"
+
+    @staticmethod
+    def _trim_brief(text: str) -> str:
+        """短反应档：只留一句、15 字以内；空内容返回空串交给调用方兜底。"""
+        t = (text or "").strip()
+        if not t:
+            return ""
+        t = re.split(r"[。！？!?…\n]", t)[0].strip()
+        if len(t) > 15:
+            # 优先在逗号处断开，保留一个完整的小句，而不是硬切半句
+            head = re.split(r"[，,、；;]", t)[0].strip()
+            t = head if 0 < len(head) <= 15 else t[:15].rstrip("，、, ")
+        if t and t[-1] not in "。！？!?…~～":
+            t += "。"
+        return t
+
     def _proactive_locked(self, fallback: str, extra_hint: str = ""):
         """主动话题与用户消息共用一把锁，保证不会同时播放两路流"""
         with self._chat_lock:
+            mode = self._proactive_mode()
             text = ""
             try:
                 llm = getattr(getattr(self, "_bot", None), "llm", None)
                 if llm is not None and hasattr(llm, "generate_proactive"):
                     hist = list(getattr(llm, "conversation_history", []) or [])[-6:]
-                    hint = self._proactive_hint()
+                    hint = self._proactive_hint(brief=(mode == "brief"))
                     if extra_hint:
                         hint += "\n" + extra_hint
+                    if mode == "brief":
+                        hint += "\n这次只应一声：一句话，15 字以内，别开新话题、别提问。"
                     text = llm.generate_proactive(hint=hint, history=hist) or ""
             except Exception as e:
                 self.log.emit(f"⚠️ 主动话题生成失败，用固定台词: {e}")
-            self._proactive_worker(text or fallback or self._pick_proactive())
+            self._proactive_worker(text or fallback or self._pick_proactive(),
+                                   brief=(mode == "brief"))
 
-    def _proactive_hint(self) -> str:
-        """给主动搭话的当下状态提示"""
+    def _proactive_hint(self, brief: bool = False) -> str:
+        """给主动搭话的当下状态提示；brief 档不谈想法/话头，免得又开一个话题"""
         h = time.localtime().tm_hour
         if 5 <= h < 10:
             slot = "清晨"
@@ -585,17 +652,19 @@ class ChatController(QObject):
         try:
             if llm is not None and hasattr(llm, "_mood_label"):
                 hint += f"你现在的心情：{llm._mood_label()}。"
-            # 空闲时自己冒出来的想法优先：从这里开口，比固定台词更像"她自己在想事"
-            thought = ""
-            if llm is not None and hasattr(llm, "take_proactive_thought"):
-                thought = llm.take_proactive_thought()
-            if thought:
-                hint += f"\n你刚才闲着的时候一直在想：{thought}。就用这个念头自然开个口，别把它念出来。"
-            if (self._proactive_cfg.get("hooks", True)
-                    and llm is not None and hasattr(llm, "take_proactive_hook")):
-                hook = llm.take_proactive_hook()
-                if hook:
-                    hint += f"\n可接的话头（用户之前说过这句）：{hook}"
+            # 空闲时自己冒出来的想法优先：从这里开口，比固定台词更像"她自己在想事"。
+            # brief 档不要想法/话头：那会把"应一声"又变成开新话题。
+            if not brief:
+                thought = ""
+                if llm is not None and hasattr(llm, "take_proactive_thought"):
+                    thought = llm.take_proactive_thought()
+                if thought:
+                    hint += f"\n你刚才闲着的时候一直在想：{thought}。就用这个念头自然开个口，别把它念出来。"
+                if (self._proactive_cfg.get("hooks", True)
+                        and llm is not None and hasattr(llm, "take_proactive_hook")):
+                    hook = llm.take_proactive_hook()
+                    if hook:
+                        hint += f"\n可接的话头（用户之前说过这句）：{hook}"
             _amb = self._ambient_sample()
             if _amb:
                 hint += "\n" + _amb
@@ -662,8 +731,19 @@ class ChatController(QObject):
         self._proactive_used.append(line)
         return line
 
-    def _proactive_worker(self, text: str):
+    def _proactive_worker(self, text: str, brief: bool = False):
         """像普通回复一样显示气泡并播报；这句话要记进历史，用户接下来的短答才有参照"""
+        # 硬闸门：用户说过不想聊的话题，主动开口直接作废（不重生成，免得绕一圈又踩雷）
+        try:
+            import memory_store as _ms
+            _banned = _ms.match_directive(text)
+            if _banned:
+                self.log.emit(f"🚫 主动话题命中禁提「{_banned}」，本轮不开口")
+                return
+        except Exception:
+            pass
+        if brief:
+            text = self._trim_brief(text) or "嗯。"
         try:
             _m = float(getattr(getattr(getattr(self, "_bot", None), "llm", None), "_mood", 0.0) or 0.0)
             if _m <= -6:
@@ -746,6 +826,12 @@ class ChatController(QObject):
         """发送用户消息（新开线程流式处理）"""
         # 用户一开口就重置主动话题的空闲计时
         self._last_user_activity = time.time()
+        # 顺带记一次"这个小时醒着"，用于估计作息（只记小时，不记内容）
+        try:
+            import memory_store
+            memory_store.note_active_hour()
+        except Exception:
+            pass
         if self._bot is None:
             self.log.emit("⚠️ 机器人尚未初始化")
             return
