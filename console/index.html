@@ -22,6 +22,9 @@
                 <button class="nav-btn" data-page="task" data-tip="任务" aria-label="任务">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
                 </button>
+                <button class="nav-btn" data-page="memory" data-tip="记忆" aria-label="记忆">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+                </button>
                 <button class="nav-btn" data-page="status" data-tip="电脑状态" aria-label="电脑状态">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
                 </button>
@@ -226,6 +229,30 @@
                     <span class="section-sub"><span id="log-count">0</span> 行<button class="log-clear" id="log-clear">清空</button></span>
                 </div>
                 <div class="log-box" id="log-box"><div class="log-empty"><div class="log-empty-title">暂无日志</div><div class="log-empty-sub">服务启动、工具调用和报错都会输出到这里</div></div></div>
+            </section>
+
+            <!-- 记忆页 -->
+            <section class="page page-memory" id="page-memory">
+                <div class="section-head">
+                    <h2>记忆</h2>
+                    <span class="section-sub"><span id="mem-sub">加载中…</span><button type="button" class="inline-retry" id="mem-refresh">刷新</button></span>
+                </div>
+                <div class="mem-stats" id="mem-stats"></div>
+
+                <div class="mem-block">
+                    <div class="mem-block-title">关于你</div>
+                    <div class="mem-entities" id="mem-entities"></div>
+                </div>
+
+                <div class="mem-block" id="mem-loop-block" style="display:none">
+                    <div class="mem-block-title">还没问的事</div>
+                    <div class="mem-loops" id="mem-loops"></div>
+                </div>
+
+                <div class="mem-block">
+                    <div class="mem-block-title">记忆片段</div>
+                    <div class="mem-list" id="mem-list"></div>
+                </div>
             </section>
 
             <!-- 设置页 -->

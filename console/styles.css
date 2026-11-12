@@ -935,6 +935,12 @@ body {
 .msg-bubble ol:last-child { margin-bottom: 0; }
 .msg-bubble li { margin: 3px 0; }
 .msg-bubble li::marker { color: var(--cyan); }
+/* 内心独白：括号里的心里话，弱化成旁白 */
+.msg-bubble .inner-os {
+    font-style: italic;
+    font-size: 0.92em;
+    color: rgba(200, 210, 240, 0.55);
+}
 .msg-bubble code {
     font-family: "Cascadia Code", Consolas, "Courier New", monospace;
     font-size: 0.92em;
@@ -1977,4 +1983,152 @@ body {
     .home-chat-messages { min-height: 140px; margin-bottom: 6px; }
     .page-home .info-grid { margin-top: 12px; }
     .info-card { padding: 14px 16px; }
+}
+
+/* ===== 记忆页 ===== */
+.mem-stats {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 20px;
+}
+
+.mem-stat {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 9px 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+
+.mem-stat-num {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--cyan);
+}
+
+.mem-stat-label {
+    font-size: 12px;
+    color: var(--text-dim);
+}
+
+.mem-block { margin-bottom: 20px; }
+
+.mem-block-title {
+    font-size: 12px;
+    letter-spacing: .08em;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+}
+
+.mem-entities {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.mem-entity {
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    font-size: 13px;
+}
+
+.mem-entity-key { color: var(--text-dim); }
+.mem-entity-val { color: var(--text); }
+
+.mem-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 760px;
+}
+
+.mem-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    transition: border-color var(--dur-fast) ease;
+}
+
+.mem-item:hover { border-color: var(--cyan); }
+
+.mem-item-main { flex: 1; min-width: 0; }
+
+.mem-item-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.mem-kind {
+    font-size: 11px;
+    padding: 1px 7px;
+    border-radius: 6px;
+    background: var(--cyan-soft);
+    color: var(--cyan);
+}
+
+.mem-kind-diary {
+    background: var(--magenta-soft);
+    color: var(--magenta);
+}
+
+.mem-date {
+    font-size: 11px;
+    color: var(--text-dim);
+}
+
+.mem-text {
+    font-size: 13px;
+    line-height: 1.55;
+    word-break: break-word;
+}
+
+.mem-del {
+    flex-shrink: 0;
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all var(--dur-fast) ease;
+}
+
+.mem-del:hover { border-color: var(--magenta); color: var(--magenta); }
+.mem-del:disabled { opacity: .5; cursor: default; }
+
+.mem-loop {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    margin-bottom: 8px;
+    max-width: 760px;
+}
+
+.mem-loop-due {
+    font-size: 11px;
+    color: var(--cyan);
+    font-variant-numeric: tabular-nums;
+}
+
+.mem-loop-text { flex: 1; font-size: 13px; }
+
+.mem-empty {
+    font-size: 13px;
+    color: var(--text-dim);
+    padding: 6px 2px;
 }

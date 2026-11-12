@@ -15,6 +15,14 @@ import subprocess
 import requests
 
 
+# 情绪 → 语速系数（同一个人不同情绪时的语速微差，±8% 以内避免变声感）
+_EMOTION_SPEED = {
+    "happy": 1.06, "excited": 1.08, "surprised": 1.05,
+    "angry": 1.05, "sad": 0.94, "sleepy": 0.92, "tired": 0.93,
+    "shy": 0.97, "gentle": 0.97, "thinking": 0.99, "idle": 1.0,
+}
+
+
 def _parse_wav_header(buf: bytes):
     """解析流式 wav 头：返回 (header_end, samplerate, channels, sampwidth)。
 
@@ -78,6 +86,7 @@ class GPTSoVITSAdapter(TTSAdapter):
         "top_P": 0.7,
         "top_K": 10,
         "speed_factor": 1.0,  # 语速 1.0=正常，1.1=稍快，0.9=稍慢
+        "emotion_prosody": True,  # 按 [情绪:xxx] 微调语速（关掉则全轮固定语速）
         "random_seed": True,  # True=每次随机采样（语气不重复），False=固定稳定
         # 首句抢先出声：首句在第一个逗号处切分后，再让 GPT-SoVITS 用 cut5 切一次，
         # 第一块语义 token 更早凑够 → 首包更快。后续句仍用 cut0，避免二次切词吞字。
@@ -102,12 +111,14 @@ class GPTSoVITSAdapter(TTSAdapter):
             print(f"[TTS] 读 tts_params.json 失败，用默认: {e}")
         return p
 
-    def _payload(self, text: str, streaming_mode=False, first=False) -> dict:
+    def _payload(self, text: str, streaming_mode=False, first=False,
+                 emotion=None) -> dict:
         """构造 /tts 请求体；streaming_mode=int 时按 GPT-SoVITS 的流式档位传。
 
         first=True 时（本轮第一句）改用 first_split_method（默认 cut5）：
         上游已把首句切到第一个逗号，这里再切一次能让首块更快凑够 token。
         后续句保持 cut0，避免二次切断词导致吞字/串音。
+        emotion 是回复里的 [情绪:xxx]：只微调语速，让同一句在不同情绪下有区别。
         """
         # 随机种子：每次换采样，语气不重复（设为 False 可回退固定 42）
         if self.params.get("random_seed", True):
@@ -117,6 +128,12 @@ class GPTSoVITSAdapter(TTSAdapter):
         split_method = "cut0"
         if first and self.params.get("first_cut5", True):
             split_method = self.params.get("first_split_method", "cut5")
+        try:
+            speed = float(self.params.get("speed_factor", 1.0))
+        except (TypeError, ValueError):
+            speed = 1.0
+        if emotion and self.params.get("emotion_prosody", True):
+            speed *= _EMOTION_SPEED.get(str(emotion).lower(), 1.0)
         payload = {
             "text": text,
             "text_lang": "zh",
@@ -132,7 +149,7 @@ class GPTSoVITSAdapter(TTSAdapter):
             "temperature": self.params.get("temperature", 0.8),
             "top_P": self.params.get("top_P", 0.8),
             "top_K": self.params.get("top_K", 20),
-            "speed_factor": self.params.get("speed_factor", 1.0),
+            "speed_factor": round(min(1.3, max(0.7, speed)), 3),
         }
         if streaming_mode:
             for key in ("fragment_interval", "min_chunk_length", "overlap_length"):
@@ -140,9 +157,9 @@ class GPTSoVITSAdapter(TTSAdapter):
                     payload[key] = self.params[key]
         return payload
 
-    def synthesize(self, text: str, output_path: str) -> bool:
+    def synthesize(self, text: str, output_path: str, emotion=None) -> bool:
         try:
-            payload = self._payload(text, False)
+            payload = self._payload(text, False, emotion=emotion)
             response = requests.post(f"{self.api_url}/tts", json=payload, timeout=60)
             if response.status_code == 200 and len(response.content) > 100:
                 with open(output_path, "wb") as f:
@@ -155,7 +172,8 @@ class GPTSoVITSAdapter(TTSAdapter):
             return False
 
     def synthesize_stream(self, text: str, output_path: str, on_start=None,
-                          on_frames=None, should_stop=None, first=False):
+                          on_frames=None, should_stop=None, first=False,
+                          emotion=None):
         """流式合成（streaming_mode=2）：边收边把裸 PCM 回调给播放层。
 
         first=True 表示本轮第一句，改用 cut5 抢先出声（可通过 tts_params.json
@@ -172,7 +190,7 @@ class GPTSoVITSAdapter(TTSAdapter):
         sr = ch = width = 0
         total = 0
         try:
-            payload = self._payload(text, 2, first=first)
+            payload = self._payload(text, 2, first=first, emotion=emotion)
             with requests.post(f"{self.api_url}/tts", json=payload,
                                timeout=(10, 20), stream=True) as resp:
                 if resp.status_code != 200:

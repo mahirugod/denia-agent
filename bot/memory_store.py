@@ -39,6 +39,9 @@ _corrupt_backed_up = False
 # 遗忘曲线：score = 重要度 * exp(-Δt / S)，S 随命中次数增长（间隔重复）
 _BASE_STABLE_DAYS = 7.0
 
+# 问"以前/原来/改了"时，允许把已失效的旧事实召回
+_PAST_RE = re.compile(r"以前|之前|原来|过去|曾经|当年|去年|小时候|改口|换成|不再|还喜欢|还玩")
+
 
 def _ensure_dir():
     os.makedirs(_SUMMARY_DIR, exist_ok=True)
@@ -50,8 +53,16 @@ def _ep_id(text: str, ts: float) -> str:
 
 
 def add_episode(text: str, kind: str = "event", mood: str = "",
-                importance: int = 3, ts: float = None) -> dict:
-    """追加一条情节。importance 1-5，决定遗忘速度。"""
+                importance: int = 3, ts: float = None, superseded: bool = False,
+                due_ts: float = 0, valid_to: float = 0,
+                extra: dict = None) -> dict:
+    """追加一条情节。importance 1-5，决定遗忘速度。
+
+    superseded=True 用于保留"已被新事实取代"的旧值：写盘备查，但不再参与召回。
+    due_ts>0 表示"未闭环话题"（用户提到的未来事件），到点后由主动搭话追问一次。
+    valid_to>0 表示这条事实的有效期到此为止：平时不参与召回，问"以前"时才翻出来。
+    extra 是额外字段（如待确认事实的 old_value/new_value）。
+    """
     text = (text or "").strip()
     if not text:
         return {}
@@ -61,13 +72,22 @@ def add_episode(text: str, kind: str = "event", mood: str = "",
         "id": _ep_id(text, ts),
         "ts": round(ts, 3),
         "date": time.strftime("%Y-%m-%d", time.localtime(ts)),
-        "kind": kind,               # event / promise / preference / mood
+        "kind": kind,               # event / promise / preference / mood / confirm / diary
         "mood": mood,
         "importance": max(1, min(5, int(importance))),
         "text": text,
         "hits": 0,
         "last_hit": 0,
     }
+    if superseded:
+        ep["superseded"] = True
+    if due_ts:
+        ep["due_ts"] = round(float(due_ts), 3)
+        ep["asked"] = False
+    if valid_to:
+        ep["valid_to"] = round(float(valid_to), 3)
+    if extra:
+        ep.update({k: v for k, v in extra.items() if v is not None})
     with _io_lock:
         with open(_EPISODES, "a", encoding="utf-8") as f:
             f.write(json.dumps(ep, ensure_ascii=False) + "\n")
@@ -131,6 +151,65 @@ def active_episodes(eps: list = None) -> list:
     """参与召回的情节：合并过的、已过时的都不再出现。"""
     eps = load_episodes() if eps is None else eps
     return [e for e in eps if not e.get("superseded") and not e.get("merged_into")]
+
+
+def open_loops(include_pending: bool = True, now: float = None,
+               grace_days: float = 3.0) -> list:
+    """还没追问过的未闭环话题（用户提过的未来事件）。
+
+    include_pending=True 时包含还没到日子的（记忆页展示用）；
+    主动搭话只问已到点的，且过期超过 grace_days 就不再翻旧账。
+    """
+    now = now or time.time()
+    out = []
+    for ep in active_episodes():
+        due = float(ep.get("due_ts") or 0)
+        if not due or ep.get("asked"):
+            continue
+        if include_pending or due <= now <= due + grace_days * 86400:
+            out.append(ep)
+    out.sort(key=lambda e: float(e.get("due_ts") or 0))
+    return out
+
+
+def due_open_loops(now: float = None, grace_days: float = 3.0) -> list:
+    """到点且还没问过的未闭环话题；主动搭话用。"""
+    return open_loops(include_pending=False, now=now, grace_days=grace_days)
+
+
+def mark_loop_asked(ep_id: str) -> bool:
+    """标记某个未闭环话题已经追问过（写回整表，走 _io_lock）。"""
+    with _io_lock:
+        eps = load_episodes()
+        hit = False
+        for ep in eps:
+            if ep.get("id") == ep_id and ep.get("due_ts") and not ep.get("asked"):
+                ep["asked"] = True
+                ep["asked_ts"] = round(time.time(), 3)
+                hit = True
+        if hit:
+            _save_episodes(eps)
+        return hit
+
+
+def recent_episodes(limit: int = 60) -> list:
+    """记忆页用：按时间倒序的活跃情节。"""
+    eps = active_episodes()
+    eps.sort(key=lambda e: float(e.get("ts") or 0), reverse=True)
+    return eps[:limit]
+
+
+def delete_episode(ep_id: str) -> bool:
+    """按 id 删除一条情节（记忆页的"忘记这条"）。"""
+    if not ep_id:
+        return False
+    with _io_lock:
+        eps = load_episodes()
+        left = [e for e in eps if e.get("id") != ep_id]
+        if len(left) == len(eps):
+            return False
+        _save_episodes(left)
+        return True
 
 
 def score(ep: dict, now: float = None) -> float:
@@ -298,10 +377,20 @@ def recall(query: str, k: int = 4, mood: float = 0, stats: dict = None,
     focus 是当前会话的稳定事实词（称呼/偏好/在玩的东西）：先用它把候选情节
     缩到同一实体上，再算相似度，避免每次召回都被无关旧事占满上下文；
     候选不够 k 条时退回全量，保证召回不会因为实体太少而落空。
+    问"以前/原来/改"这类话时，把已失效的旧说法也放回候选。
     """
     with _io_lock:  # 读-改-写要串行，否则并发召回会互相覆盖 hits
         all_eps = load_episodes()
         eps = active_episodes(all_eps)
+        # 待确认的改口记录不进普通召回（由主动搭话处理，别当成"用户说过"注入）
+        eps = [e for e in eps if e.get("kind") != "confirm"]
+        if _PAST_RE.search(query or ""):
+            expired = [e for e in all_eps
+                       if e.get("valid_to") and not e.get("merged_into")]
+            if expired:
+                eps = eps + expired
+                if isinstance(stats, dict):
+                    stats["expired"] = len(expired)
         if not eps:
             return []
         lex = _lexical_scores(query, eps)

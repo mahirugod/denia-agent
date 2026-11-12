@@ -359,9 +359,51 @@ class TerminalApp(QObject):
         except Exception:
             pass
 
-    def get_memories(self) -> list:
-        """记忆库已移除，返回空列表（控制台 memory 页显示"暂无记忆"）"""
-        return []
+    def get_memories(self) -> dict:
+        """记忆页数据：实体、最近情节、未闭环话题与统计。"""
+        out = {"entities": [], "episodes": [], "loops": [],
+               "stats": {"total": 0, "loops": 0, "entities": 0}}
+        try:
+            import memory_store as ms
+        except Exception:
+            return out
+        try:
+            eps = ms.recent_episodes(60)
+            out["episodes"] = [{
+                "id": e.get("id", ""),
+                "date": e.get("date", ""),
+                "kind": e.get("kind", "event"),
+                "text": e.get("text", ""),
+                "importance": e.get("importance", 3),
+            } for e in eps]
+            loops = ms.open_loops()
+            out["loops"] = [{
+                "id": e.get("id", ""),
+                "text": e.get("text", ""),
+                "due": time.strftime("%m-%d %H:%M", time.localtime(float(e.get("due_ts")))),
+            } for e in loops]
+            all_eps = ms.active_episodes()
+            out["stats"]["total"] = len(all_eps)
+            out["stats"]["loops"] = len(loops)
+        except Exception as e:
+            print(f"[记忆页] 读取失败: {e}")
+        try:
+            llm = getattr(getattr(self.controller, "_bot", None), "llm", None)
+            ents = getattr(llm, "_mem_entities", {}) or {}
+            out["entities"] = [{"key": k, "value": v} for k, v in ents.items()]
+            out["stats"]["entities"] = len(ents)
+        except Exception:
+            pass
+        return out
+
+    def delete_memory(self, ep_id: str) -> bool:
+        """记忆页「忘记这条」：按 id 删除一条情节。"""
+        try:
+            import memory_store as ms
+            return bool(ms.delete_episode(ep_id))
+        except Exception as e:
+            print(f"[记忆页] 删除失败: {e}")
+            return False
 
     def get_tasks(self) -> list:
         tasks = []
@@ -486,6 +528,25 @@ class TerminalApp(QObject):
             {**model_items[1], "group": "模型"},
             {**model_items[2], "group": "模型"},
             {
+                "label": "认知档位",
+                "key": "cognition_tier",
+                "value": self._settings.get("cognition_tier", "standard"),
+                "type": "preset_select",
+                "options": [
+                    {"value": "saver", "label": "省电 · 预算 8k / 召回 2 条 / 每 4 条压缩"},
+                    {"value": "standard", "label": "标准 · 预算 14k / 召回 4 条 / 每 6 条压缩（默认）"},
+                    {"value": "deep", "label": "深度 · 预算 24k / 召回 7 条 / 每 8 条压缩"},
+                ],
+                "group": "认知",
+            },
+            {
+                "label": "档位同时决定 prompt 预算、记忆召回条数与摘要压缩频率，切换后立即生效",
+                "key": "_cognition_hint",
+                "value": "",
+                "type": "hint",
+                "group": "认知",
+            },
+            {
                 "label": "启用 NapCat（QQ 消息转发）",
                 "key": "napcat",
                 "value": self.napcat_enabled(),
@@ -543,6 +604,33 @@ class TerminalApp(QObject):
                     target=lambda: self.controller.reinit_bot(self._do_init_bot),
                     daemon=True,
                 ).start()
+        elif key == "cognition_tier":
+            # 认知档位：把预算 / 召回条数 / 摘要频率打包写盘，并立即套用到运行中的实例
+            try:
+                from denia_llm import COGNITION_PRESETS as _P
+            except Exception:
+                _P = {}
+            preset = _P.get(value)
+            if not preset:
+                return
+            self._save_settings({
+                "cognition_tier": value,
+                "prompt_budget_chars": preset["prompt_budget_chars"],
+                "recall_k": preset["recall_k"],
+                "summary_interval": preset["summary_interval"],
+            })
+            llm = getattr(getattr(self.controller, "_bot", None), "llm", None)
+            if llm is not None:
+                try:
+                    llm._prompt_budget_chars = preset["prompt_budget_chars"]
+                    llm._recall_k = preset["recall_k"]
+                    llm._summary_interval = preset["summary_interval"]
+                    llm._apply_prompt_budget()
+                except Exception:
+                    pass
+            self._on_log(
+                f"🧠 认知档位: {preset['label']}（预算 {preset['prompt_budget_chars']} 字"
+                f" / 召回 {preset['recall_k']} 条 / 摘要每 {preset['summary_interval']} 条）")
         elif key == "model_name":
             # 切换 LLM 模型：写 settings.json + 后台重新初始化
             self._save_settings({"model_name": value})

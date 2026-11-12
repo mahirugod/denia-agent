@@ -148,6 +148,16 @@ function setupMockBridge() {
             { idx: 2, text: "接入语音合成流式播放", done: false, prio: "中" },
         ])),
         complete_task: () => { },
+        get_memories: () => wrap(JSON.stringify({
+            entities: [{ key: "我的称呼", value: "小林" }, { key: "我在玩", value: "鸣潮" }],
+            loops: [{ id: "m1", text: "面试", due: "11-13 10:00" }],
+            episodes: [
+                { id: "m2", date: "2026-11-12", kind: "event", text: "用户今天加班到很晚", importance: 3 },
+                { id: "m3", date: "2026-11-12", kind: "diary", text: "今天他提到：面试；加班。就这样安静地过了一天，也还好。", importance: 5 },
+            ],
+            stats: { total: 2, loops: 1, entities: 2 },
+        })),
+        delete_memory: () => wrap(true),
         get_services: () => wrap(JSON.stringify([
             { name: "warp", display: "Cloudflare WARP", state: "stopped" },
             { name: "gpt_sovits", display: "GPT-SoVITS 语音合成", state: "running" },
@@ -160,6 +170,11 @@ function setupMockBridge() {
             { label: "LLM 模型", key: "model_name", value: "qwen2.5:7b", type: "model_select", group: "模型", options: [
                 { label: "qwen2.5:7b（本地）", value: "qwen2.5:7b" },
                 { label: "DeepSeek V4（云端）", value: "deepseek" },
+            ] },
+            { label: "认知档位", key: "cognition_tier", value: "standard", type: "preset_select", group: "认知", options: [
+                { label: "省电 · 预算 8k / 召回 2 条 / 每 4 条压缩", value: "saver" },
+                { label: "标准 · 预算 14k / 召回 4 条 / 每 6 条压缩（默认）", value: "standard" },
+                { label: "深度 · 预算 24k / 召回 7 条 / 每 8 条压缩", value: "deep" },
             ] },
             { label: "启用 NapCat（QQ 消息转发）", key: "napcat", value: false, type: "bool", group: "运行" },
             { label: "启动时自动检测并补齐服务", key: "autostart", value: true, type: "bool", group: "运行" },
@@ -282,6 +297,7 @@ navBtns.forEach(btn => {
         document.getElementById('page-' + target).classList.add('active');
         // 进入页面时刷新数据
         if (target === 'task') loadTasks();
+        if (target === 'memory') loadMemories();
         if (target === 'status') loadSystemStatus();
         if (target === 'launch') refreshServices();
         if (target === 'settings') loadSettings();
@@ -421,7 +437,10 @@ function _inlineMarkdown(s) {
     return s
         .replace(/`([^`\n]+)`/g, '<code>$1</code>')
         .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
-        .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+        .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>')
+        // 内心独白：（…）只显示不朗读，弱化处理
+        .replace(/（([^（）\n]{1,24})）/g, '<i class="inner-os">（$1）</i>')
+        .replace(/\(([^()\n]{1,24})\)/g, '<i class="inner-os">($1)</i>');
 }
 
 function renderRichText(text) {
@@ -1825,6 +1844,14 @@ function loadSettings() {
                 row.innerHTML = `
                     <span class="set-label">${s.label}</span>
                     <select class="model-select" data-key="${s.key}" data-old="${s.value}" aria-label="${s.label}" title="${String(selLabel).replace(/"/g, '&quot;')}">${opts}</select>`;
+            } else if (s.type === 'preset_select' && s.options) {
+                let opts = s.options.map(o =>
+                    `<option value="${o.value}" ${o.value === s.value ? 'selected' : ''}>${o.label}</option>`
+                ).join('');
+                const presetLabel = (s.options.find(o => o.value === s.value) || {}).label || s.value;
+                row.innerHTML = `
+                    <span class="set-label">${s.label}</span>
+                    <select class="preset-select" data-key="${s.key}" data-old="${s.value}" aria-label="${s.label}" title="${String(presetLabel).replace(/"/g, '&quot;')}">${opts}</select>`;
             } else if (s.type === 'str' && s.key) {
                 const inputVal = s.value ? s.value.replace(/"/g, '&quot;') : '';
                 row.innerHTML = `
@@ -1877,6 +1904,18 @@ function loadSettings() {
                 setTimeout(() => loadSettings(), 600);
             });
         });
+        // 认知档位下拉框（省电/标准/深度，切换后立即生效）
+        container.querySelectorAll('.preset-select').forEach(sel => {
+            sel.addEventListener('change', () => {
+                const key = sel.dataset.key;
+                const old = sel.dataset.old;
+                bridge.save_setting(key, sel.value);
+                showSettingsToast('已保存，认知档位立即生效', () => {
+                    bridge.save_setting(key, old);
+                    setTimeout(loadSettings, 300);
+                });
+            });
+        });
         // 文本输入框（带 key 的 str 类型）
         container.querySelectorAll('.setting-input').forEach(inp => {
             const commit = () => {
@@ -1923,3 +1962,115 @@ style.textContent = `
 .svc-btn:hover { border-color: var(--cyan); color: var(--cyan); }
 `;
 document.head.appendChild(style);
+
+// ===== 记忆页 =====
+const MEM_KIND_LABEL = { event: "经历", promise: "约定", preference: "偏好", mood: "心情", diary: "日记" };
+
+function memEl(tag, cls, text) {
+    const el = document.createElement(tag);
+    if (cls) el.className = cls;
+    if (text !== undefined) el.textContent = text;
+    return el;
+}
+
+function forgetMemory(id, btn) {
+    if (!bridge || !bridge.delete_memory || !id) return;
+    btn.disabled = true;
+    Promise.resolve(bridge.delete_memory(id)).then(ok => {
+        if (ok) loadMemories();
+        else btn.disabled = false;
+    }).catch(() => { btn.disabled = false; });
+}
+
+function renderMemoryItem(ep) {
+    const item = memEl('div', 'mem-item');
+    const main = memEl('div', 'mem-item-main');
+    const meta = memEl('div', 'mem-item-meta');
+    meta.appendChild(memEl('span', 'mem-kind mem-kind-' + (ep.kind || 'event'),
+        MEM_KIND_LABEL[ep.kind] || ep.kind || '经历'));
+    meta.appendChild(memEl('span', 'mem-date', ep.date || ''));
+    main.appendChild(meta);
+    main.appendChild(memEl('div', 'mem-text', ep.text || ''));
+    const del = memEl('button', 'mem-del', '忘记');
+    del.type = 'button';
+    del.dataset.tip = '让她忘掉这条记忆';
+    del.addEventListener('click', () => forgetMemory(ep.id, del));
+    item.appendChild(main);
+    item.appendChild(del);
+    return item;
+}
+
+function loadMemories() {
+    if (!bridge || !bridge.get_memories) return;
+    Promise.resolve(bridge.get_memories()).then(raw => {
+        let data = null;
+        try { data = JSON.parse(raw); } catch (e) { }
+        const sub = document.getElementById('mem-sub');
+        const stats = document.getElementById('mem-stats');
+        const entsBox = document.getElementById('mem-entities');
+        const loopBox = document.getElementById('mem-loops');
+        const loopBlock = document.getElementById('mem-loop-block');
+        const list = document.getElementById('mem-list');
+        if (!data || data.error) {
+            if (sub) sub.textContent = '读取失败';
+            return;
+        }
+        const st = data.stats || {};
+        if (sub) {
+            sub.textContent = `${st.total || 0} 条记忆 · ${st.entities || 0} 个实体 · ${st.loops || 0} 件待追问`;
+        }
+        if (stats) {
+            stats.innerHTML = '';
+            [['记忆', st.total || 0], ['实体', st.entities || 0], ['待追问', st.loops || 0]].forEach(([k, v]) => {
+                const chip = memEl('div', 'mem-stat');
+                chip.appendChild(memEl('span', 'mem-stat-num', String(v)));
+                chip.appendChild(memEl('span', 'mem-stat-label', k));
+                stats.appendChild(chip);
+            });
+        }
+        if (entsBox) {
+            entsBox.innerHTML = '';
+            const ents = data.entities || [];
+            if (!ents.length) {
+                entsBox.appendChild(memEl('div', 'mem-empty', '还没记住关于你的事，多聊聊吧。'));
+            } else {
+                ents.forEach(e => {
+                    const chip = memEl('span', 'mem-entity');
+                    chip.appendChild(memEl('span', 'mem-entity-key', (e.key || '') + '：'));
+                    chip.appendChild(memEl('span', 'mem-entity-val', e.value || ''));
+                    entsBox.appendChild(chip);
+                });
+            }
+        }
+        if (loopBox && loopBlock) {
+            loopBox.innerHTML = '';
+            const loops = data.loops || [];
+            loopBlock.style.display = loops.length ? '' : 'none';
+            loops.forEach(l => {
+                const item = memEl('div', 'mem-loop');
+                item.appendChild(memEl('span', 'mem-loop-due', l.due || ''));
+                item.appendChild(memEl('span', 'mem-loop-text', l.text || ''));
+                const del = memEl('button', 'mem-del', '忘记');
+                del.type = 'button';
+                del.addEventListener('click', () => forgetMemory(l.id, del));
+                item.appendChild(del);
+                loopBox.appendChild(item);
+            });
+        }
+        if (list) {
+            list.innerHTML = '';
+            const eps = data.episodes || [];
+            if (!eps.length) {
+                list.appendChild(memEl('div', 'mem-empty', '暂无记忆片段。聊过的事会在这里慢慢积累。'));
+            } else {
+                eps.forEach(ep => list.appendChild(renderMemoryItem(ep)));
+            }
+        }
+    }).catch(() => {
+        const sub = document.getElementById('mem-sub');
+        if (sub) sub.textContent = '读取失败';
+    });
+}
+
+const memRefresh = document.getElementById('mem-refresh');
+if (memRefresh) memRefresh.addEventListener('click', loadMemories);

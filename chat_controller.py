@@ -69,6 +69,15 @@ def _clean_display_text(text: str, for_tts: bool = False) -> str:
     return text.strip()
 
 
+# 内心独白：模型用（…）写没说出口的话，只显示、不朗读
+_INNER_OS_RE = re.compile(r"[（(][^（）()\n]{1,30}[）)]")
+
+
+def _strip_inner_os(text: str) -> str:
+    """语音合成前去掉括号里的内心独白；显示路径保留原文。"""
+    return _INNER_OS_RE.sub("", text or "").strip()
+
+
 # 情绪标签 → 立绘状态（扩充词映射到现有立绘资产；Web 端另有 CSS 动画区分细腻情绪）
 class ChatController(QObject):
     """对话控制器：管理 LLM、语音合成、麦克风输入"""
@@ -145,6 +154,7 @@ class ChatController(QObject):
         self._voice_incomplete = False  # 播放线程是否提前退出（打断/设备故障）
         self._turn_reply = ""           # 本轮 LLM 完整回复（截断时用于定位历史条目）
         self._turn_reply_sid = 0
+        self._turn_emotion = ""         # 本轮 [情绪:xxx]，用于 TTS 语速微调
 
         # VAD 打断监听（说话自动停播）——默认关闭，避免误触发
         self._vad_enabled = False
@@ -337,6 +347,40 @@ class ChatController(QObject):
             pass
         return cfg
 
+    def _relationship_scale(self) -> float:
+        """关系越熟，主动搭话间隔越短（1.0 → 0.6）；读不到就按 1.0。"""
+        try:
+            import relationship
+            return float(relationship.interval_scale())
+        except Exception:
+            return 1.0
+
+    def _energy_scale(self) -> float:
+        """她越累，主动搭话的间隔越长（1.0 → 1.5）。"""
+        try:
+            return float(self._bot.llm.energy_scale())
+        except Exception:
+            return 1.0
+
+    def _due_loop(self):
+        """到期且还没追问过的未闭环话题（"明天面试"这类）；没有就返回 None。
+
+        只有关系熟到"熟悉"阶段才追问：刚认识就问面试/生日会显得越界。
+        不达标时话题保留在库里，等关系涨上来再问。
+        """
+        try:
+            import relationship
+            if not relationship.followup_ok():
+                return None
+        except Exception:
+            pass
+        try:
+            import memory_store
+            loops = memory_store.due_open_loops()
+            return loops[0] if loops else None
+        except Exception:
+            return None
+
     def _in_dnd(self) -> bool:
         """当前是否处于不打扰时段（支持 23:00-08:00 跨零点）"""
         try:
@@ -367,13 +411,20 @@ class ChatController(QObject):
                 self._proactive_mark = self._last_user_activity
                 self._proactive_miss = 0
             _miss = int(getattr(self, "_proactive_miss", 0))
+            # 到点的未闭环话题优先，且不受常规间隔限制（仍尊重硬冷却）
+            loop = self._due_loop()
             if self._last_proactive_ts:
                 gap = now - self._last_proactive_ts
-                # 连续几次没人理，就逐步拉长间隔，别越冷场越起劲（可用开关关掉）
-                _factor = (2 ** min(_miss, 3)) if c.get("backoff", True) else 1
-                need = float(c["interval_min"]) * 60 * _factor
-                if gap < need or gap < float(c["cooldown_min"]) * 60:
+                if gap < float(c["cooldown_min"]) * 60:
                     return
+                if not loop:
+                    # 连续几次没人理，就逐步拉长间隔，别越冷场越起劲（可用开关关掉）
+                    _factor = (2 ** min(_miss, 3)) if c.get("backoff", True) else 1
+                    # 关系越熟间隔越短：熟悉之后更愿意主动找你说话
+                    need = (float(c["interval_min"]) * 60 * _factor
+                            * self._relationship_scale() * self._energy_scale())
+                    if gap < need:
+                        return
             if self._in_dnd():
                 return
             if self._voice_thread is not None and self._voice_thread.is_alive():
@@ -387,14 +438,38 @@ class ChatController(QObject):
                     return
             except Exception:
                 pass
+            loop_hint = ""
+            if loop:
+                if loop.get("kind") == "confirm":
+                    # 事实变更待确认：不是催进度，只是确认现在以哪个为准
+                    loop_hint = (f"用户之前说「{loop.get('old_value', '')}」，"
+                                 f"后来又说「{loop.get('new_value', '')}」。"
+                                 f"找个自然的时机确认一下现在以哪个为准，一句话，别像查岗。")
+                else:
+                    loop_hint = (f"用户之前提过「{loop.get('text', '')}」，今天到日子了。"
+                                 f"先自然地问一句进展，别像查岗。")
+                try:
+                    import memory_store
+                    memory_store.mark_loop_asked(loop.get("id", ""))
+                except Exception:
+                    pass
+            # 上一次主动搭话没人理：她会失落一点、精力也掉（只影响语气，不阻止这次开口）
+            if _miss >= 1:
+                try:
+                    _llm = getattr(getattr(self, "_bot", None), "llm", None)
+                    if _llm is not None and hasattr(_llm, "note_unanswered"):
+                        _llm.note_unanswered(_miss)
+                except Exception:
+                    pass
             self._last_proactive_ts = now
             self._proactive_miss = _miss + 1
             self._stream_active = True
-            threading.Thread(target=self._proactive_locked, args=(None,), daemon=True).start()
+            threading.Thread(target=self._proactive_locked,
+                             args=(None, loop_hint), daemon=True).start()
         except Exception as e:
             self.log.emit(f"⚠️ 主动话题调度异常: {e}")
 
-    def _proactive_locked(self, fallback: str):
+    def _proactive_locked(self, fallback: str, extra_hint: str = ""):
         """主动话题与用户消息共用一把锁，保证不会同时播放两路流"""
         with self._chat_lock:
             text = ""
@@ -402,8 +477,10 @@ class ChatController(QObject):
                 llm = getattr(getattr(self, "_bot", None), "llm", None)
                 if llm is not None and hasattr(llm, "generate_proactive"):
                     hist = list(getattr(llm, "conversation_history", []) or [])[-6:]
-                    text = llm.generate_proactive(
-                        hint=self._proactive_hint(), history=hist) or ""
+                    hint = self._proactive_hint()
+                    if extra_hint:
+                        hint += "\n" + extra_hint
+                    text = llm.generate_proactive(hint=hint, history=hist) or ""
             except Exception as e:
                 self.log.emit(f"⚠️ 主动话题生成失败，用固定台词: {e}")
             self._proactive_worker(text or fallback or self._pick_proactive())
@@ -769,6 +846,9 @@ class ChatController(QObject):
             self._turn_reply_sid = _sid
 
             if reply:
+                _emo = re.search(r"\[情绪[:：]([\w\u4e00-\u9fff]+)\]", reply)
+                if _emo:
+                    self._turn_emotion = _emo.group(1)
                 clean = _clean_display_text(reply)
                 self.reply_ready.emit(clean)
                 self._recent_replies.append(clean)  # 回声防护样本
@@ -786,6 +866,10 @@ class ChatController(QObject):
             self._stream_active = False
 
     def _emit_delta(self, d: str):
+        # 情绪标签只在原始增量里：记下本轮情绪，合成时用来微调语速（显示层照旧剥掉）
+        _emo = re.search(r"\[情绪[:：]([\w\u4e00-\u9fff]+)\]", d)
+        if _emo:
+            self._turn_emotion = _emo.group(1)
         # 开头可能是被流式切碎的 TOOL:...ARGS:{...} 标记：先缓存原始增量，
         # 出现首个汉字/换行后再整体清洗放行（避免半截标记被逐段清洗后留下 JSON 残渣）
         if not getattr(self, "_prefix_ready", True):
@@ -854,6 +938,7 @@ class ChatController(QObject):
         self._voice_spoken_sid = _sid
         self._voice_spoken_text = ""
         self._voice_incomplete = False
+        self._turn_emotion = ""
         self._voice_synth_thread = threading.Thread(
             target=synth_target, args=(ready_q, interrupt), daemon=True
         )
@@ -1098,23 +1183,36 @@ class ChatController(QObject):
                         if _parts:
                             _pending_pieces = list(_parts)
                             clean_seg = _pending_pieces.pop(0)
+                # 内心独白只显示不朗读：整段都是独白时没有音频，仍把文字推给前端
+                _speech = _strip_inner_os(clean_seg)
+                if not _speech:
+                    while not interrupt.is_set():
+                        try:
+                            ready_q.put((clean_seg, None), timeout=0.3)
+                            break
+                        except queue.Full:
+                            continue
+                    continue
                 wav_path = os.path.join(
                     tempfile.gettempdir(),
                     f"dania_voice_{int(time.time() * 1000)}_{idx}.wav",
                 )
                 idx += 1
-                ok = synth.synthesize(clean_seg, wav_path)
+                ok = synth.synthesize(_speech, wav_path,
+                                      emotion=getattr(self, "_turn_emotion", ""))
                 # 质量兜底：时长/字数明显偏离正常语速（吞字或拖沓）就换随机种子重合成一次
                 if ok:
                     try:
                         import wave as _wq
                         with _wq.open(wav_path, "rb") as _f:
                             _dur = _f.getnframes() / float(_f.getframerate() or 1)
-                        _n = max(1, len(re.sub(r"[\s，。！？、…—\"“”]", "", clean_seg)))
+                        _n = max(1, len(re.sub(r"[\s，。！？、…—\"“”]", "", _speech)))
                         _per = _dur / _n
                         if _per < 0.08 or _per > 0.45:
                             self.log.emit(f"⚠️ 合成异常({_per:.2f}s/字)，重试一次")
-                            ok = synth.synthesize(clean_seg, wav_path)
+                            ok = synth.synthesize(
+                                _speech, wav_path,
+                                emotion=getattr(self, "_turn_emotion", ""))
                     except Exception:
                         pass
                 if interrupt.is_set():
@@ -1184,6 +1282,11 @@ class ChatController(QObject):
                         if _parts:
                             _pending_pieces = list(_parts)
                             clean_seg = _pending_pieces.pop(0)
+                # 内心独白只显示不朗读：整段都是独白就直接推纯文本给播放端
+                _speech = _strip_inner_os(clean_seg)
+                if not _speech:
+                    _put(("os", clean_seg))
+                    continue
 
                 wav_path = os.path.join(
                     tempfile.gettempdir(),
@@ -1200,11 +1303,12 @@ class ChatController(QObject):
 
                 # 不做整段质量重试：流式已经播出，重合成会造成重复/割裂
                 info = synth.synthesize_stream(
-                    clean_seg, wav_path,
+                    _speech, wav_path,
                     on_start=_on_start,
                     on_frames=_on_frames,
                     should_stop=interrupt.is_set,
                     first=_is_first,
+                    emotion=getattr(self, "_turn_emotion", ""),
                 )
                 if not info:
                     self.log.emit("⚠️ 一句合成失败，跳过")
@@ -1309,7 +1413,14 @@ class ChatController(QObject):
                         spoken_parts.append(cur_seg)
                     cur_seg = ""
                 else:
-                    self.log.emit("⚠️ 一句合成失败，跳过")
+                    # 没有音频（纯内心独白）：文字照常推给前端，0ms 立即显示
+                    if seg and (sid is None or sid == self._stream_session):
+                        try:
+                            self.voice_segment.emit(seg, 0.0)
+                        except Exception:
+                            pass
+                    else:
+                        self.log.emit("⚠️ 一句合成失败，跳过")
         except Exception as e:
             self.log.emit(f"❌ 语音出错: {e}")
         finally:
@@ -1367,7 +1478,7 @@ class ChatController(QObject):
             except OSError:
                 pass
             return
-        if item[0] in ("pcm", "eos"):
+        if item[0] in ("pcm", "eos", "os"):
             return
         ChatController._discard_wav(item)
 
@@ -1451,6 +1562,15 @@ class ChatController(QObject):
                     interrupted = True
                     break
                 kind = item[0] if isinstance(item, tuple) and item else ""
+                if kind == "os":
+                    # 纯内心独白段：没有音频，0ms 推给前端立刻整段显示
+                    _os_text = item[1] if len(item) > 1 else ""
+                    if _os_text and (sid is None or sid == self._stream_session):
+                        try:
+                            self.voice_segment.emit(_os_text, 0.0)
+                        except Exception:
+                            pass
+                    continue
                 if kind == "seg":
                     _, seg_text, wav_path, _sr, _ch, _sw = item
                     cur = (seg_text, wav_path, _sr, _ch)
@@ -1884,7 +2004,9 @@ class ChatController(QObject):
                 import winsound
 
                 self._stop_stream_voice()
-                clean = _clean_display_text(text, for_tts=True)
+                clean = _strip_inner_os(_clean_display_text(text, for_tts=True))
+                if not clean:
+                    return  # 只有内心独白：没有可朗读的内容
                 if self._voice_synth.synthesize(clean, wav_path):
                     self.voice_replay_state.emit(True)
                     winsound.PlaySound(wav_path, winsound.SND_FILENAME)

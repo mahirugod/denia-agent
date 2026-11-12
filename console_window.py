@@ -195,6 +195,14 @@ class BridgeObject(QObject):
         except Exception as e:
             return json.dumps({"error": str(e)})
 
+    @Slot(str, result=bool)
+    def delete_memory(self, ep_id: str) -> bool:
+        """JS 调用：忘记一条记忆"""
+        try:
+            return bool(self.app.delete_memory(ep_id))
+        except Exception:
+            return False
+
     # ===== 天气 =====
     @Slot(result=str)
     def get_weather(self) -> str:

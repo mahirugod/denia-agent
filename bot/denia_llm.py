@@ -65,6 +65,26 @@ def _setting_bool(key: str, default: bool = True) -> bool:
         return default
 
 
+def _setting_str(key: str, default: str = "") -> str:
+    """读 settings.json 里的字符串项（读不到就用默认值）"""
+    try:
+        path = os.path.join(os.path.dirname(_DATA_DIR), "..", "settings.json")
+        with open(path, "r", encoding="utf-8") as f:
+            v = json.load(f).get(key, default)
+        return str(v).strip().lower() if v is not None else default
+    except Exception:
+        return default
+
+
+# 认知档位：把 prompt 预算、记忆召回条数、摘要频率打包成三档，设置页一键切换。
+# 省电 = 省 token / 快；深度 = 上下文更足、记得更多。
+COGNITION_PRESETS = {
+    "saver": {"label": "省电", "prompt_budget_chars": 8000, "recall_k": 2, "summary_interval": 4},
+    "standard": {"label": "标准", "prompt_budget_chars": 14000, "recall_k": 4, "summary_interval": 6},
+    "deep": {"label": "深度", "prompt_budget_chars": 24000, "recall_k": 7, "summary_interval": 8},
+}
+
+
 # 只有纯省略标记才做指代补全；「她什么时候上线」这类代词问句规则引擎会补错，交给模型
 _FOLLOWUP_MARK_RE = re.compile(
     r"^(?:那?个?呢|呢|继续|然后呢?|接着(?:说|讲)?|详细(?:说说|讲讲)?|再(?:说说|讲讲)|说说|讲讲)[？?]?$"
@@ -1114,6 +1134,8 @@ class DeniaLLM:
 - 不要编造自己的经历：没有真的发生过的事不要说（"我上次…""我以前…""我之前也…"），
   没做过的事别装做过；只在知识库/对话里确有其事时才提。想表达看法就说看法。
 - 留点人味：可以有"……"的停顿、偶尔重复一个词（"知道了知道了"）、偶尔说半句就停；句子不必句句工整完整，也不必每句都带"～"。
+- 偶尔用（…）写一句没说出口的心里话（如"（他今天怎么这么安静）"），一句以内、不超过 20 字；
+  这是内心独白，只会显示在屏幕上、不会被念出来。括号只用来写这个，别用括号补充解释。
 - 被问到自己怎么运作，一句带过就好（"这个我真不知道"也行），别描述内部过程（"我刚刚想太久忘了说话""我脑子一片空白"）。
 - 多数回复一句就够：可以只评价、只吐槽、只答不问，不必每条都凑成"评价 + 建议 + 反问"三段；问句只在关心或真需要信息时出现，一轮最多一个。
 - 主观问题（怎么配卡、怎么选、值不值、好不好玩）直接用你自己的理解和喜好聊，不用先搜资料；搜索只留给客观事实（版本号、卡池、价格、发售日）。
@@ -1237,7 +1259,11 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         # ===== 全局 prompt 预算 =====
         # 各块单独有上限（台词 ~820 字、检索 ~820 字），但整体没有总预算；
         # 超限时先砍台词样本，规则层永不裁剪。
-        self._prompt_budget_chars = _setting_int("prompt_budget_chars", 14000)
+        # 默认值由认知档位决定（设置页 省电/标准/深度 一键切换）
+        _preset = COGNITION_PRESETS.get(
+            _setting_str("cognition_tier", "standard"), COGNITION_PRESETS["standard"])
+        self._prompt_budget_chars = _setting_int(
+            "prompt_budget_chars", int(_preset["prompt_budget_chars"]))
         self._apply_prompt_budget()
 
         # 看图规则（仅在消息含图片时注入）
@@ -1255,7 +1281,10 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         # A+C 轻量记忆状态（须在 _load_history 前初始化，供其恢复）
         self._rolling_summary = ""  # 滚动摘要（≤50字）
         self._rolling_count = 0  # 摘要滚动计数
-        self._summary_interval = 6  # 每 6 轮滚动一次
+        # 摘要频率与召回条数同样跟认知档位走（设置页切换会写回这两个键）
+        self._summary_interval = _setting_int(
+            "summary_interval", int(_preset["summary_interval"]))
+        self._recall_k = _setting_int("recall_k", int(_preset["recall_k"]))
         self._mem_entities = {}  # 关键实体（纯规则抽取）
 
         # Harness（载具档位）+ ToolGuard（护栏）
@@ -1341,18 +1370,53 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                 '（最新在前，第一项是最近这一轮；用户问「分别用了多久」就按顺序对应，'
                 '超出记录范围的轮次如实说没记录）')
 
+    def _bump_relationship(self, user_input: str):
+        """每次用户发言推进一点熟悉度（跨会话累积，落盘在退出时）。"""
+        try:
+            from tool_registry import is_remote_restricted
+            if is_remote_restricted():
+                return  # 访客/群聊不推进主人的关系值
+        except Exception:
+            pass
+        try:
+            import relationship
+            relationship.bump(user_input)
+        except Exception:
+            pass
+        # 聊得越多越累；离线期间在 _load_mood 里慢慢恢复
+        try:
+            self._energy = max(5.0, float(getattr(self, "_energy", 70.0)) - 0.6)
+            self._save_mood()
+        except Exception:
+            pass
+
+    def _relationship_hint(self) -> str:
+        """相处阶段提示：随聊天频率缓慢变化，影响称呼与主动关心的尺度。"""
+        try:
+            from tool_registry import is_remote_restricted
+            if is_remote_restricted():
+                return ""  # 访客会话不暴露亲密度
+        except Exception:
+            pass
+        try:
+            import relationship
+            return "\n" + relationship.hint()
+        except Exception:
+            return ""
+
     def _system_prompt_with_guest_rule(self) -> str:
         """基础提示词；访客会话（QQ 群聊/非主人私聊）额外追加不得改写设定的边界。"""
         _mem = getattr(self, "_pending_memory_block", "")
         _suffix = ("\n\n" + _mem) if _mem else ""
         _tone = self._tone_block()
+        _rel = self._relationship_hint()
         try:
             from tool_registry import is_remote_restricted
             if is_remote_restricted():
-                return self.system_prompt + _tone + _GUEST_BOUNDARY + _suffix
+                return self.system_prompt + _tone + _rel + _GUEST_BOUNDARY + _suffix
         except Exception:
             pass
-        return self.system_prompt + _tone + _suffix
+        return self.system_prompt + _tone + _rel + _suffix
 
     @staticmethod
     def _load_style_examples() -> str:
@@ -1709,18 +1773,26 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
 
     def _load_mood(self) -> float:
         """读分数，并按离线时长向平静回落（离开越久越淡）"""
+        self._energy = 70.0
         try:
             with open(self._mood_file, encoding="utf-8") as f:
                 d = json.load(f)
             score = max(-10.0, min(10.0, float(d.get("score", 0.0))))
             self._mood_reason = str(d.get("reason") or "")
             try:
+                self._energy = max(5.0, min(100.0, float(d.get("energy", 70.0))))
+            except Exception:
+                self._energy = 70.0
+            try:
                 upd = float(d.get("updated") or 0)
             except Exception:
                 upd = 0.0
             hours = (time.time() - upd) / 3600.0 if upd else 0.0
-            if hours > 0 and score:
-                score = score * (0.85 ** min(hours, 12.0))
+            if hours > 0:
+                # 离线期间她在休息：精力按小时回一点（最多回满）
+                self._energy = min(100.0, self._energy + hours * 6.0)
+                if score:
+                    score = score * (0.85 ** min(hours, 12.0))
             return score
         except Exception:
             self._mood_reason = ""
@@ -1733,11 +1805,28 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"score": round(self._mood, 1),
                            "reason": self._mood_reason,
+                           "energy": round(float(getattr(self, "_energy", 70.0)), 1),
                            "updated": round(time.time(), 3)},
                           f, ensure_ascii=False)
             os.replace(tmp, self._mood_file)
         except Exception:
             pass
+
+    def note_unanswered(self, times: int = 1):
+        """主动搭话一直没人理：心情和精力都往下走一点（有上限，别把她写崩）。"""
+        try:
+            dip = min(1.2, 0.4 * max(1, int(times)))
+            self._mood = max(-10.0, self._mood - dip)
+            self._energy = max(5.0, float(getattr(self, "_energy", 70.0)) - 2.0)
+            self._mood_reason = "刚才主动说话一直没人理"
+            self._save_mood()
+        except Exception:
+            pass
+
+    def energy_scale(self) -> float:
+        """精力越低，主动搭话的间隔越长（1.0 → 1.5）。"""
+        e = max(0.0, min(100.0, float(getattr(self, "_energy", 70.0))))
+        return round(1.0 + 0.5 * (100.0 - e) / 100.0, 2)
 
     def _mood_name(self) -> str:
         m = self._mood
@@ -1770,6 +1859,11 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         else:
             how = "能短就短，一到两句；不撒娇、不主动起话题；但用户问的事照样认真答。"
         lines = [f"- 你现在的心情：{self._mood_name()}，{how}"]
+        _e = float(getattr(self, "_energy", 70.0))
+        if _e < 25:
+            lines.append("- 你现在有点累（精力低），回得更短，少主动起话题，允许带点没劲的口气。")
+        elif _e > 85:
+            lines.append("- 你现在精神很好，可以多说一句，偶尔主动找点话。")
         if self._mood_reason:
             lines.append(f"- 心情来由（不要复述这句，只当语气底色）：{self._mood_reason}。")
         if 0 <= time.localtime().tm_hour < 6:
@@ -2053,11 +2147,11 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         # 正在做的事：「我最近在X」「我现在在X」「我这几天在忙X」
         m = _re.search(r"我(?:最近|现在|这几天|这阵子)(?:正在|在|忙着|都在)?([\u4e00-\u9fa5\w]{2,12})", text)
         if m:
-            self._mem_entities.setdefault("我最近", m.group(1))
+            self._set_entity("我最近", m.group(1), mutable=True)
         # 游戏名（小模型易错，固定词表）
         for g in ["鸣潮", "原神", "崩坏", "崩铁", "星穹", "王者荣耀", "明日方舟", "库洛"]:
             if g in text or g in text.replace("庫", "库").replace("潮", "潮"):
-                self._mem_entities.setdefault("我在玩", g)
+                self._set_entity("我在玩", g, mutable=True)
         # 地名：「去X」「在X」「到X」「X市/县/区/省」
         m = _re.search(r"(?:去|到|在)([\u4e00-\u9fa5]{2,4}(?:市|县|区|省))", text)
         if m:
@@ -2079,6 +2173,148 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                     break
                 if k not in _keep:
                     self._mem_entities.pop(k, None)
+
+    _LOOP_TIME_RE = re.compile(r"(明天|后天|今晚|周末|下周[一二三四五六日天])")
+    _LOOP_ACTION_KW = (
+        "面试", "考试", "体检", "出差", "答辩", "复查", "搬家", "生日", "约会",
+        "聚餐", "旅行", "上课", "上班", "开会", "参加", "上线", "开服",
+        "发布", "更新", "截止", "交稿", "发货", "到货", "开庭", "报到",
+    )
+
+    def _extract_open_loop(self, text: str):
+        """把"明天面试"这类未来事件存成到点会被追问的未闭环话题。
+
+        只认明确时间词 + 具体事件，避免把普通闲聊变成提醒；同一天同类事件只留一条。
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        m = self._LOOP_TIME_RE.search(text)
+        if not m:
+            return
+        clauses = [c for c in re.split(r"[。！？!?；;，,\n]", text) if c.strip()]
+        clause = next((c for c in clauses if m.group(1) in c), "")
+        # 用命中的事件词本身做标签（"明天上午要去面试" → "面试"）：
+        # 整句容易带上"好紧张/有点怕"这类修饰，追问时反而不好接。
+        hits = [w for w in self._LOOP_ACTION_KW if w in clause]
+        if not hits:
+            return
+        event = max(hits, key=len)
+        word = m.group(1)
+        from datetime import timedelta
+        now = datetime.now()
+        try:
+            if word == "明天":
+                due = now + timedelta(days=1)
+            elif word == "后天":
+                due = now + timedelta(days=2)
+            elif word == "今晚":
+                due = now.replace(hour=21, minute=0, second=0, microsecond=0)
+            elif word == "周末":
+                due = now + timedelta(days=(5 - now.weekday()) % 7)
+            else:  # 下周X
+                idx = "一二三四五六日天".index(word[-1])
+                wd = 6 if idx == 6 else idx
+                due = now + timedelta(days=7 - now.weekday() + wd)
+            if word != "今晚":
+                due = due.replace(hour=10, minute=0, second=0, microsecond=0)
+        except Exception:
+            return
+        if not (2 <= len(event) <= 30):
+            return
+        try:
+            import memory_store as _ms
+            for ep in _ms.active_episodes():
+                if ep.get("due_ts") and not ep.get("asked") and ep.get("text") == event:
+                    return
+            _ms.add_episode(event, kind="promise", importance=4, due_ts=due.timestamp())
+            print(f"[记忆] 记下未闭环话题：{event}（{due.strftime('%m-%d %H:%M')}）")
+        except Exception:
+            pass
+
+    def _maybe_write_diary(self):
+        """每天最多一条第一人称日记：只用当天已抽取的情节拼接，不额外发请求。
+
+        日记以 importance=5 入库，之后可以像普通旧事一样被召回，
+        让"她自己的视角"也参与长期记忆，而不只是用户说过的事实。
+        """
+        try:
+            import memory_store as _ms
+            today = time.strftime("%Y-%m-%d")
+            all_eps = _ms.load_episodes()
+            if any(e.get("kind") == "diary" and e.get("date") == today for e in all_eps):
+                return
+            today_eps = [e for e in all_eps
+                         if e.get("date") == today
+                         and not e.get("superseded") and e.get("kind") != "diary"]
+            if len(today_eps) < 2:
+                return
+            picked = [str(e.get("text", "")).strip()[:40] for e in today_eps[-3:]]
+            picked = [t for t in picked if t]
+            if not picked:
+                return
+            mood = self._mood_label()
+            if self._mood <= -3:
+                close = "心里有点沉，希望明天能好一点。"
+            elif self._mood >= 3:
+                close = "今天心情不错，想记住这种轻飘飘的感觉。"
+            else:
+                close = "就这样安静地过了一天，也还好。"
+            line = f"今天他提到：{'；'.join(picked)}。{close}"
+            _ms.add_episode(line, kind="diary", mood=mood, importance=5)
+            print(f"[日记] {line}")
+        except Exception:
+            pass
+
+    def _set_entity(self, key: str, value: str, mutable: bool = False):
+        """写实体。可变事实（在玩 / 最近在做）用覆盖，旧值留一条已取代情节备查。
+
+        以前一律 setdefault：用户从鸣潮换到原神后，「我在玩」永远停在旧值，
+        还会持续被注入 prompt。称呼、偏好这类稳定事实仍保持 setdefault。
+        """
+        value = (value or "").strip()
+        if not value:
+            return
+        old = self._mem_entities.get(key)
+        if old == value:
+            return
+        if mutable and old:
+            try:
+                import memory_store as _ms
+                # 旧值带 valid_to 留档：平时不召回，问"以前"还能翻出来
+                _ms.add_episode(f"用户之前说过：{old}", kind="preference",
+                                importance=2, superseded=True,
+                                valid_to=time.time())
+            except Exception:
+                pass
+            # 关系够熟时，隔一天自然确认一下现在以哪个为准
+            try:
+                import relationship
+                if relationship.followup_ok() and key in (
+                        "我喜欢", "我不喜欢", "我在玩", "我的称呼"):
+                    self._queue_confirm(key, old, value)
+            except Exception:
+                pass
+        self._mem_entities[key] = value
+
+    def _queue_confirm(self, key: str, old: str, new: str):
+        """事实改口后挂一条待确认话题；同类未问过的 3 天内不重复挂。"""
+        try:
+            import memory_store as _ms
+            now = time.time()
+            for ep in _ms.active_episodes():
+                if (ep.get("kind") == "confirm" and not ep.get("asked")
+                        and ep.get("entity_key") == key
+                        and now - float(ep.get("ts") or 0) < 3 * 86400):
+                    return
+            _ms.add_episode(f"确认{key}：之前是「{old}」，现在是「{new}」",
+                            kind="confirm", importance=4,
+                            due_ts=now + 86400,
+                            extra={"entity_key": key, "old_value": old,
+                                   "new_value": new})
+            print(f"[记忆] 待确认事实：{key} {old} → {new}")
+        except Exception:
+            pass
 
     def _get_memory_injection(self) -> str:
         """组装记忆注入串：摘要 + 最多 3 条最相关实体。恒 ≤ 120 字。"""
@@ -2121,7 +2357,8 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         _st = {}
         try:
             _mood = self._mood if _setting_bool("mood_enabled", True) else 0
-            hits = _ms.recall(user_input, k=4, mood=_mood, stats=_st,
+            hits = _ms.recall(user_input, k=int(getattr(self, "_recall_k", 4) or 4),
+                              mood=_mood, stats=_st,
                               focus=list((getattr(self, "_mem_entities", {}) or {}).values()))
             if _st.get("boosted") or _st.get("suppressed"):
                 print(f"[记忆] 召回 {_st.get('count', 0)} 条（情绪加权 "
@@ -2140,7 +2377,8 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
             "聊天里自然提到就行，别列成清单，别当成别人的故事）"
         ]
         for h in hits:
-            parts.append(f"- {h.get('date', '')} {h.get('text', '')}")
+            _past = "（以前的说法，现在可能已经改了）" if h.get("valid_to") else ""
+            parts.append(f"- {h.get('date', '')} {_past}{h.get('text', '')}")
         if summary:
             parts.append("【你们之前聊到过】\n" + summary)
         return "\n".join(parts)[: self._MEMORY_INJECT_CAP]
@@ -2255,11 +2493,22 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                     print(f"[自思考] {thought}")
             except Exception:
                 pass
+        # 当天聊得够多就留一篇第一人称日记（规则拼接，不额外发请求）
+        self._maybe_write_diary()
         if added or dropped:
             print(f"[记忆] 新增 {added} 条情节，归档 {dropped} 条")
 
     def flush_memory_on_exit(self, timeout: float = 8):
         """退出钩子：跳过空闲等待，同步抽取最后一次。限时 8 秒，超时就放弃。"""
+        try:
+            import relationship
+            relationship.flush()
+        except Exception:
+            pass
+        try:
+            self._save_mood()  # 精力/心情最后落一次盘
+        except Exception:
+            pass
         try:
             with self._mem_lock:
                 if self._mem_timer is not None:
@@ -4481,6 +4730,8 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         _stream_t0 = _time_mod.time()  # 推理计时起点（从请求进入到流式完成）
         self.observe_user_message(user_input)  # 用户这句话会牵动她的心情（被凶/被夸/共情）
         self._refresh_style_anchor(user_input)  # 按这句话挑台词组（失败保持原样本）
+        self._bump_relationship(user_input)  # 跨会话熟悉度：她和你越来越熟
+        self._extract_open_loop(user_input)  # "明天面试"这种未来事件，到点会追问
         self._pending_memory_block = self._long_memory_block(user_input)  # 召回旧事
 
         # 每轮都显式赋值：上一轮的图片描述不能泄漏到本轮纯文本对话
@@ -5193,6 +5444,8 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         # 检测是否询问达妮娅本人信息（期望傲娇推脱回复，不搜索不修正）
         self._is_personal_question = self._is_dania_personal_question(user_input)
         self._refresh_style_anchor(user_input)  # 按这句话挑台词组（失败保持原样本）
+        self._bump_relationship(user_input)  # 跨会话熟悉度
+        self._extract_open_loop(user_input)  # 未来事件 → 到点追问
         self._pending_memory_block = self._long_memory_block(user_input)  # 召回旧事
 
         # 工具路由：命中关键词则执行工具，结果作为上下文注入（由 LLM 以人设转述）
@@ -5666,6 +5919,7 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                     combined_context += "\n" + personality_prompt
             except Exception as e:
                 print(f"[个性] 获取提示失败: {e}")
+        combined_context += self._relationship_hint()
 
         # 用户画像注入（非流式路径，仅 ags/云端，本地小模型跳过）
         if getattr(self, "_is_agnes", False) or getattr(self, "_is_cloud", False):

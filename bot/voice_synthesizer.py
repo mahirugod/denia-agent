@@ -165,7 +165,8 @@ class VoiceSynthesizer:
         # 3. 兜底：就当系统里有
         return "ffmpeg"
 
-    def synthesize(self, text: str, output_path: str = "output.wav") -> bool:
+    def synthesize(self, text: str, output_path: str = "output.wav",
+                   emotion: str = "") -> bool:
         """
         调用语音合成API生成语音
 
@@ -193,14 +194,14 @@ class VoiceSynthesizer:
 
         if len(segments) == 1:
             # 单段直接合成
-            return self._synth_one_segment(segments[0], output_path)
+            return self._synth_one_segment(segments[0], output_path, emotion=emotion)
         else:
             # 多段分段合成后拼接
             wav_paths = []
             try:
                 for i, seg in enumerate(segments):
                     seg_path = f"{output_path}.part{i}.wav"
-                    if not self._synth_one_segment(seg, seg_path):
+                    if not self._synth_one_segment(seg, seg_path, emotion=emotion):
                         print(f"[TTS] 第{i+1}段合成失败: {seg[:20]}...")
                         # 失败的段跳过，继续合成后续段
                         continue
@@ -243,10 +244,12 @@ class VoiceSynthesizer:
                     pass
 
     def synthesize_stream(self, text: str, output_path: str, on_start=None,
-                          on_frames=None, should_stop=None, first=False):
+                          on_frames=None, should_stop=None, first=False,
+                          emotion: str = ""):
         """流式合成：边收边回调 PCM（供增量播放）。
 
         first=True 表示本轮第一句：允许引擎用更激进的切分抢先出声。
+        emotion 是回复里的 [情绪:xxx]，只用于微调语速。
         返回 (samplerate, channels, sampwidth, frames)；完全失败返回 None。
         单段优先走引擎 streaming_mode；超长句沿用整段合成后按块喂给播放层。
         """
@@ -258,7 +261,7 @@ class VoiceSynthesizer:
         segments = self._split_text_for_tts(cleaned, max_len=80)
         if len(segments) > 1:
             # 超长句：GPT-SoVITS 对流式长文本不稳定，整段合成后按块喂
-            if not self.synthesize(text, output_path):
+            if not self.synthesize(text, output_path, emotion=emotion):
                 return None
             return self._feed_wav_file(output_path, on_start, on_frames, should_stop)
 
@@ -266,12 +269,13 @@ class VoiceSynthesizer:
             if hasattr(adapter, "synthesize_stream"):
                 info = adapter.synthesize_stream(
                     segments[0], output_path, on_start=on_start,
-                    on_frames=on_frames, should_stop=should_stop, first=first)
+                    on_frames=on_frames, should_stop=should_stop, first=first,
+                    emotion=emotion)
                 if info:
                     self._last_engine_name = adapter.name
                     return info
         # 引擎不支持流式或首块失败（此时尚未播出任何帧）→ 整段合成后按块喂
-        if self.synthesize(text, output_path):
+        if self.synthesize(text, output_path, emotion=emotion):
             return self._feed_wav_file(output_path, on_start, on_frames, should_stop)
         return None
 
@@ -314,19 +318,20 @@ class VoiceSynthesizer:
         print(f"[TTS] 可用引擎: {names if names else '无'}")
         return chain
 
-    def _synth_one_segment(self, text: str, output_path: str) -> bool:
+    def _synth_one_segment(self, text: str, output_path: str,
+                           emotion: str = "") -> bool:
         """合成单个文本段（仅 GPT-SoVITS；失败返回 False，不发声）"""
         print(f"[TTS] 合成文本: {text[:50]}{'...' if len(text)>50 else ''} (共{len(text)}字)")
 
         # 第一轮：用缓存引擎
         for adapter in self._get_engine_chain():
-            if adapter.synthesize(text, output_path):
+            if adapter.synthesize(text, output_path, emotion=emotion):
                 self._last_engine_name = adapter.name
                 return True
 
         # 第二轮：引擎可能刚启动，强制重新探测重试一次
         for adapter in self._get_engine_chain(force_refresh=True):
-            if adapter.synthesize(text, output_path):
+            if adapter.synthesize(text, output_path, emotion=emotion):
                 self._last_engine_name = adapter.name
                 return True
 

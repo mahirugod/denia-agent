@@ -53,6 +53,11 @@ def main():
     memory_store._VEC_PATH = os.path.join(_eval_mem, "vectors.npy")
     memory_store._VEC_META = os.path.join(_eval_mem, "vectors_meta.json")
     memory_store._ARCHIVE = os.path.join(_eval_mem, "episodes_archive.jsonl")
+    # 关系熟悉度也会随每轮发言增长，同样隔离到 eval 目录，别写进真实数据
+    import relationship
+    relationship._FILE = os.path.join(_eval_mem, "relationship.json")
+    relationship._state.update({"familiarity": 0.0, "days": 0, "last_seen": "", "turns": 0})
+    relationship._loaded["done"] = True
     from denia_llm import DeniaLLM
 
     with contextlib.redirect_stdout(sys.stderr):
