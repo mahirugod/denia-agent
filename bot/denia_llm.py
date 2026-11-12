@@ -42,6 +42,16 @@ def _retention_days() -> int:
         return 30
 
 
+def _setting_int(key: str, default: int) -> int:
+    """读 settings.json 里的整数项（读不到就用默认值）"""
+    try:
+        path = os.path.join(os.path.dirname(_DATA_DIR), "..", "settings.json")
+        with open(path, "r", encoding="utf-8") as f:
+            return int(json.load(f).get(key, default))
+    except Exception:
+        return default
+
+
 def _setting_bool(key: str, default: bool = True) -> bool:
     """读 settings.json 里的布尔开关（读不到就用默认值）"""
     try:
@@ -1179,6 +1189,10 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         self._mood_file = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "data", "mood.json")
         self._mood = self._load_mood()
+        # 情绪分层：基线（_mood，慢衰减）+ 短暂情绪（transient，几轮后过期）。
+        # 低落用滞回开关，避免心情在 -6 附近来回抖动导致口气忽冷忽热。
+        self._mood_low_active = self._mood <= -6
+        self._tone_transient = None  # (档位, 剩余轮数)
 
         # 达妮娅官方台词样本库（说话风格参考）
         self._style_examples = self._load_style_examples()
@@ -1215,6 +1229,12 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                     "\n需要按某套方法做事时，先调用 load_skill 读取完整步骤，再照步骤调用工具执行。")
         except Exception:
             pass
+
+        # ===== 全局 prompt 预算 =====
+        # 各块单独有上限（台词 ~820 字、检索 ~820 字），但整体没有总预算；
+        # 超限时先砍台词样本，规则层永不裁剪。
+        self._prompt_budget_chars = _setting_int("prompt_budget_chars", 14000)
+        self._apply_prompt_budget()
 
         # 看图规则（仅在消息含图片时注入）
         self._image_prompt = "消息有[图片内容:...]。直接对画面内容做出反应，2-3句，把它当成你亲眼看到的场景。"
@@ -1410,6 +1430,41 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         if not a or not b:
             return False
         return len(a & b) / min(len(a), len(b)) >= 0.6
+
+    def _apply_prompt_budget(self):
+        """全局 prompt 预算：超限时按优先级裁剪。
+
+        只砍台词样本（唯一可以整体去掉的大块），人设、规则、任务层、
+        本地状态一律保留——规则被截半句比丢掉几句示例危险得多。
+        """
+        try:
+            budget = int(getattr(self, "_prompt_budget_chars", 0))
+        except (TypeError, ValueError):
+            return
+        if budget <= 0 or not self.system_prompt:
+            return
+        if len(self.system_prompt) <= budget:
+            return
+        _pat = re.escape(_STYLE_MARK_BEGIN) + r".*?" + re.escape(_STYLE_MARK_END)
+        m = re.search(_pat, self.system_prompt, re.S)
+        if m:
+            block = m.group(0)
+            over = len(self.system_prompt) - budget
+            keep = len(block) - over - 40  # 留出行尾和结束标记的位置
+            if keep >= 200:
+                new_block = block[:keep].rstrip() + "\n" + _STYLE_MARK_END
+                self.system_prompt = (self.system_prompt[:m.start()]
+                                      + new_block + self.system_prompt[m.end():])
+                _metric_bump("prompt_trim_style")
+            else:
+                self.system_prompt = (self.system_prompt[:m.start()]
+                                      + self.system_prompt[m.end():])
+                _metric_bump("prompt_drop_style")
+            print(f"[Prompt] 超预算 {budget} 字，台词块已裁剪至 {len(self.system_prompt)} 字")
+        if len(self.system_prompt) > budget:
+            _metric_bump("prompt_over_budget")
+            print(f"[Prompt] 仍超预算 {budget} 字：{len(self.system_prompt)} 字"
+                  f"（规则层未裁剪，建议调低台词块或提高 prompt_budget_chars）")
 
     def _refresh_style_anchor(self, user_input: str):
         """按当前这句话检索最相关的台词组，替换掉常驻的样本块。
@@ -1768,12 +1823,24 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         """
         hour = time.localtime().tm_hour
         m = self._mood
+        # 滞回：跌到 -6 才进入低落，回到 -4 以上才退出
+        if m <= -6:
+            self._mood_low_active = True
+        elif m >= -4:
+            self._mood_low_active = False
+        _tr = getattr(self, "_tone_transient", None)
         if hour < 6:
             picked = "sleepy"
-        elif m <= -6:
+        elif _tr and _tr[1] > 0:
+            # 短暂情绪优先于基线，剩余轮数递减，到 0 自动回落到基线档位
+            picked = _tr[0]
+            self._tone_transient = (_tr[0], _tr[1] - 1) if _tr[1] > 1 else None
+        elif getattr(self, "_mood_low_active", False):
             picked = "low"
         elif getattr(self, "_user_low_turn", False):
             picked = "soft"
+            # 用户这轮在诉苦：心疼不只作用一句，后面两轮也延续
+            self._tone_transient = ("soft", 2)
         else:
             pool = ["lazy", "prickly", "bright"]
             prev = getattr(self, "_tone_register", "")
@@ -2255,6 +2322,8 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         self._rolling_count = 0
         self._mem_entities = {}
         self._tone_block_cache = None
+        self._tone_transient = None
+        self._mood_low_active = self._mood <= -6
         try:
             if os.path.exists(self._history_file):
                 os.remove(self._history_file)
