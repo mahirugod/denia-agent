@@ -135,6 +135,48 @@ def directives_block() -> str:
             + "。别主动问、别主动提；只有用户自己先说起，才可以接话。")
 
 
+def render_memory_block(hits: list, summary: str = "", dir_block: str = "",
+                        cap: int = 520) -> str:
+    """把召回结果按"用前闸门"的四档拼成 prompt 块（纯函数，便于单测）。
+
+    - explicit 自然说起
+    - ask 先问一句，别当成事实端出来
+    - implicit 只用来把握分寸，不主动提
+    - 她自己的承诺单独一段，避免和人说的话混在一起
+    """
+    explicit = [h for h in hits if h.get("use_mode", "explicit") == "explicit"]
+    ask = [h for h in hits if h.get("use_mode") == "ask"]
+    implicit = [h for h in hits if h.get("use_mode") == "implicit"]
+    mine = [h for h in explicit if h.get("speaker") == "assistant"]
+    facts = [h for h in explicit if h.get("speaker") != "assistant"]
+    if not hits and not summary and not dir_block:
+        return ""
+    parts = []
+    if dir_block:
+        parts.append(dir_block)
+    if facts:
+        parts.append("【你还记得的事】（这些是用户亲口说过的，不是设定、不是剧情。"
+                     "聊天里自然提到就行，别列成清单，别当成别人的故事）")
+        for h in facts:
+            past = "（以前的说法，现在可能已经改了）" if h.get("valid_to") else ""
+            parts.append(f"- {h.get('date', '')} {past}{h.get('text', '')}")
+    if mine:
+        parts.append("【你自己答应过的事】（这些是你自己说的，找机会兑现，别装作没说过）")
+        for h in mine:
+            parts.append(f"- {h.get('date', '')} {h.get('text', '')}")
+    if ask:
+        parts.append("【想提先问一句】（这些还没到该直接说的时候。如果这轮自然聊到，"
+                     "先用一句问回去，别当成事实端出来，也别追问细节）")
+        for h in ask[:2]:
+            parts.append(f"- {(h.get('text') or '')[:40]}")
+    if implicit:
+        parts.append("【只用来把握分寸，不必主动提】" + "；".join(
+            (h.get("text") or "")[:24] for h in implicit[:2]))
+    if summary:
+        parts.append("【你们之前聊到过】\n" + summary)
+    return "\n".join(parts)[:cap]
+
+
 def disputes(ep: dict, now: float = None) -> float:
     """有效异议强度：被否认的次数按 90 天半衰，越近越重。
 
@@ -549,6 +591,75 @@ def _sim(a: str, b: str) -> float:
 _RESOLVE_MIN = 0.30
 
 
+def episode_count() -> int:
+    """现有情节条数（冷启动判断用）。"""
+    try:
+        return len(load_episodes())
+    except Exception:
+        return 0
+
+
+def recurrence(text: str, tail: int = 300) -> float:
+    """这段文本与既有情节的最高相似度：判断是不是"同一主题又一次出现"。
+
+    复现触发抽取靠它——第一次提到的事先只留在历史里，第二次才值得花一次
+    LLM 调用去抽取，省调用也保护一次性经历不被合并吃掉。
+    """
+    try:
+        eps = [e for e in load_episodes()[-tail:]
+               if not e.get("superseded") and not e.get("merged_into")]
+    except Exception:
+        return 0.0
+    if not eps:
+        return 0.0
+    pieces = [p.strip() for p in re.split(r"[。！？!?；;\n]", text or "")
+              if len(p.strip()) >= 4]
+    if not pieces:
+        return 0.0
+    best = 0.0
+    for p in pieces:
+        for e in eps:
+            s = _sim(p, e.get("text") or "")
+            if s > best:
+                best = s
+    return best
+
+
+# 记忆的"用前闸门"：准确记得 ≠ 适合提起。
+# 按敏感度、涉及他人、关联强弱，把每条召回分成四档：
+#   drop     这轮不提（也不进 prompt）
+#   implicit 只用来把握分寸，不主动说
+#   ask      想提先问一句，不要直接当成事实端出来
+#   explicit 可以自然说起
+_SENSITIVE_KW = ("病", "医院", "手术", "抑郁", "焦虑", "吃药", "工资", "薪水", "欠",
+                 "债", "分手", "离婚", "吵架", "去世", "失业", "体检", "密码", "身份证", "贷款")
+_THIRD_PARTY_KW = ("我妈", "我爸", "我朋友", "我同事", "我对象", "我男朋友", "我女朋友",
+                   "我室友", "我领导", "我老师", "我家里", "我家人")
+
+
+def use_gate(ep: dict, score: float, query: str = "", guest: bool = False) -> str:
+    """决定这条记忆这轮该怎么用（四档之一）。纯规则，不额外调模型。"""
+    text = ep.get("text") or ""
+    q = query or ""
+    kind = ep.get("kind") or "event"
+    # 旧说法且关联不强：别提，免得把过期的事说成现在
+    if ep.get("valid_to") and score < 0.55:
+        return "drop"
+    # 敏感话题、当前也没在聊：先问一句再展开，别直接摊开
+    if any(w in text for w in _SENSITIVE_KW) and not any(w in q for w in _SENSITIVE_KW):
+        return "ask"
+    # 涉及别人且不是当前话题：不替第三方转述
+    if any(w in text for w in _THIRD_PARTY_KW) and score < 0.62:
+        return "ask"
+    # 群聊场景不主动端出私聊里的偏好和承诺
+    if guest and kind in ("preference", "promise", "diary"):
+        return "implicit"
+    # 关联弱：只用来把握分寸
+    if score < 0.50:
+        return "implicit"
+    return "explicit"
+
+
 # ── 情绪一致的记忆更容易被想起 ──
 # 只做关键词判断：代价为零，且对已经入库的旧情节同样生效（不需要重新抽取）。
 _NEG_WORDS = ("累", "难过", "烦", "哭", "失眠", "加班", "生气", "失望", "难受",
@@ -640,7 +751,7 @@ def _build_vectors(eps: list, digest: str):
 
 
 def recall(query: str, k: int = 4, mood: float = 0, stats: dict = None,
-           focus: list = None) -> list:
+           focus: list = None, guest: bool = False) -> list:
     """按当前这句话召回相关情节；命中会累加 hits（影响后续遗忘速度）。
 
     mood 是当前心情分数（-10~10）：情绪一致的旧事更容易被想起，
@@ -768,10 +879,19 @@ def recall(query: str, k: int = 4, mood: float = 0, stats: dict = None,
                     tgt["last_hit"] = round(time.time(), 3)
                     if isinstance(stats, dict):
                         stats["resolved"] = stats.get("resolved", 0) + 1
+        # 用前闸门：记得准不代表适合说出来，逐条判 drop/implicit/ask/explicit
+        for ep in out:
+            try:
+                ep["use_mode"] = use_gate(ep, float(ep.get("_score") or 0), query, guest)
+            except Exception:
+                ep["use_mode"] = "explicit"
+        _dropped = sum(1 for e in out if e.get("use_mode") == "drop")
+        out = [e for e in out if e.get("use_mode") != "drop"]
         if out:
             _save_episodes(all_eps)
         if isinstance(stats, dict):
             stats["count"] = len(out)
+            stats["dropped"] = _dropped
             stats["boosted"] = sum(1 for i in order[:_n_active] if boosts[i] > 1.0)
             stats["suppressed"] = sum(1 for i in order[:_n_active] if boosts[i] < 1.0)
         return out

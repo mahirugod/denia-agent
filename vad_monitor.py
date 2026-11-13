@@ -55,7 +55,8 @@ class VadMonitor:
                  should_stop=None,            # 前置阶段中止（如本会话语音已自然结束）
                  hard_stop=None,              # 捕获阶段强制中止（如应用退出）
                  on_state=None,               # 状态回调（"listening" / "capturing"）
-                 on_frame=None):              # 捕获阶段的 PCM 帧回调（流式识别用）
+                 on_frame=None,               # 捕获阶段的 PCM 帧回调（流式识别用）
+                 should_continue=None):       # 静音到点后再确认一次：True 表示这句话还没说完
         self.prob_threshold = prob_threshold
         self.energy_threshold = energy_threshold
         self.min_speech_ms = min_speech_ms
@@ -65,6 +66,8 @@ class VadMonitor:
         self.hard_stop = hard_stop or (lambda: False)
         self.on_state = on_state or (lambda s: None)
         self.on_frame = on_frame
+        self.should_continue = should_continue or (lambda: False)
+        self._extend_left = 2  # 最多延长两次静音窗口，避免一直等下去
 
     def run(self):
         """返回捕获的 PCM bytes；未触发返回 None；麦克风不可用抛异常"""
@@ -136,6 +139,16 @@ class VadMonitor:
                 else:
                     silence_ms += BLOCK_MS
                 if silence_ms >= self.silence_ms:
+                    # 语义上还没说完（"因为…""然后…"）→ 再等一个静音窗口
+                    if self._extend_left > 0:
+                        try:
+                            _more = bool(self.should_continue())
+                        except Exception:
+                            _more = False
+                        if _more:
+                            self._extend_left -= 1
+                            silence_ms = 0
+                            continue
                     break
                 if time.time() - t_start > self.max_capture_s:
                     break

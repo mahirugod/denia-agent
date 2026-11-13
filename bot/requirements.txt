@@ -14,3 +14,5 @@ yt-dlp>=2023.0.0
 # ---- 记忆检索（dense_retrieval / memory_* 里按需 import）----
 numpy>=1.24,<3.0
 fastembed>=0.3,<1.0
+# ---- 工具参数修复（可选：未安装时回退到内置最小修复）----
+json-repair>=0.30

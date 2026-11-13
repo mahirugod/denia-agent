@@ -1158,6 +1158,7 @@ class ChatController(QObject):
     def _vad_worker(self, interrupt, session_done):
         """VAD 监视线程：用户开口自动停播，捕获语音识别后作为新输入提交"""
         asr = None
+        _partial = {"text": ""}
         try:
             from vad_monitor import VadMonitor
 
@@ -1166,7 +1167,11 @@ class ChatController(QObject):
                 from streaming_asr import StreamingASR, available as _stream_asr_ok
 
                 if _stream_asr_ok():
-                    asr = StreamingASR(on_partial=lambda t: self.voice_partial.emit(t))
+                    def _on_partial(t):
+                        _partial["text"] = t or ""
+                        self.voice_partial.emit(t)
+
+                    asr = StreamingASR(on_partial=_on_partial)
             except Exception as e:
                 self.log.emit(f"⚠️ 流式识别不可用，回落整句识别: {str(e)[:50]}")
 
@@ -1174,6 +1179,8 @@ class ChatController(QObject):
                 should_stop=lambda: interrupt.is_set() or session_done.is_set(),
                 hard_stop=lambda: self._vad_abort.is_set(),
                 on_frame=(asr.accept if asr is not None else None),
+                # 静音到点后再判断一次说没说完，避免把"因为…"截成半句
+                should_continue=lambda: self._utterance_unfinished(_partial["text"]),
             )
             data = mon.run()
         except Exception as e:
@@ -1203,6 +1210,10 @@ class ChatController(QObject):
                 self.log.emit("🔇 疑似扬声器回声，已忽略")
                 self.state_changed.emit("idle")
                 return
+            if self._is_filler(text):
+                self.log.emit(f"🔇 只是应声「{text}」，不当作打断")
+                self.state_changed.emit("idle")
+                return
             self.log.emit(f"🗣️ 打断捕获: {text}")
             self._last_manual_send_ts = time.time()  # VAD 发送也标记，防后续重复
             self.user_message.emit(text)
@@ -1226,6 +1237,28 @@ class ChatController(QObject):
         except Exception as e:
             self.log.emit(f"⚠️ 捕获音频处理失败: {e}")
             return ""
+
+    # 句尾是这些词，说明话还没说完——再多等一个静音窗口（相当于轻量轮次判断，
+    # 不需要额外模型：流式识别的高频局部结果已经够了）
+    _UNFINISHED_TAIL = ("然后", "还有", "而且", "因为", "所以", "但是", "就是", "那个",
+                        "这个", "的话", "跟", "和", "、", "，", ",")
+    # 纯应声，不当作"打断"
+    _FILLER_ONLY = ("嗯", "嗯嗯", "啊", "哦", "哦哦", "呃", "唔", "诶", "哎", "唉",
+                    "那个", "这个", "好的", "对", "是")
+
+    def _utterance_unfinished(self, text: str) -> bool:
+        """流式识别的局部文本是否明显没说完（VAD 句尾二次确认用）。"""
+        t = (text or "").strip()
+        if not t:
+            return False
+        if t[-1] in "。！？!?…":
+            return False
+        return any(t.endswith(x) for x in self._UNFINISHED_TAIL)
+
+    def _is_filler(self, text: str) -> bool:
+        """只哼了一声/应了一句，不该打断正在播放的语音。"""
+        t = re.sub(r"[\s，。！？、,.!?~～…]", "", text or "")
+        return bool(t) and len(t) <= 3 and t in self._FILLER_ONLY
 
     def _looks_like_echo(self, text: str) -> bool:
         """识别文本与最近 assistant 回复高度相似 → 判定为扬声器回声"""

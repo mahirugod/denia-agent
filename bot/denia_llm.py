@@ -131,6 +131,19 @@ _READONLY_TOOLS = frozenset({
     "load_skill", "read_skill_file", "bilibili_feed", "browse_url",
 })
 
+# 复现门控的直通信号：这些内容第一次出现也值得抽取，不等第二次
+_MEM_SALIENT_RE = re.compile(
+    r"记住|别忘|记一下|我叫|我的生日|我喜欢|我不喜欢|我讨厌|我过敏|过敏|答应|"
+    r"以后每天|每天|习惯|我家|开心|难过|生气|害怕|崩溃|累死|想你|分手|辞职|搬家|考研|面试"
+)
+
+# 她自己说出口的承诺："等下帮你查""明天提醒你"
+_PROMISE_RE = re.compile(
+    r"(?:等一下|等下|等会|待会儿?|过会儿?|稍等|马上|晚点|回头|之后|明天|一会儿)"
+    r"[^，。！？!?]{0,8}(?:我|帮你|给你|提醒|告诉|发你|找|陪你)"
+    r"|我(?:等会|待会儿?|明天|晚点|回头)?(?:再)?(?:帮你|给你|提醒你|告诉你|发你)"
+)
+
 
 def cleanup_stale_history(active_file: str = ""):
     """归档长期未使用的会话历史（每个进程只跑一次）
@@ -923,15 +936,48 @@ def _to_call(name: str, args: dict) -> dict:
     return {"id": "call_0", "name": name, "arguments": json.dumps(args or {}, ensure_ascii=False)}
 
 
+def _repair_json(raw: str) -> dict:
+    """修复坏 JSON 参数（本地小模型常给单引号/尾逗号/截断/带代码围栏）。
+
+    优先用 json_repair；没装就退回到本地最小修复，保证行为一致。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        import json_repair
+        out = json_repair.loads(text)
+        if isinstance(out, dict) and out:
+            print("[工具] 参数 JSON 已修复（json_repair）")
+            return out
+    except Exception:
+        pass
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S).strip()
+    s = re.sub(r",\s*([}\]])", r"\1", s)           # 尾逗号
+    for pat, rep in ((r"'([^']*)'\s*:", r'"\1":'),   # 单引号键
+                     (r":\s*'([^']*)'", r': "\1"')):  # 单引号值
+        s = re.sub(pat, rep, s)
+    try:
+        out = json.loads(s)
+        if isinstance(out, dict) and out:
+            print("[工具] 参数 JSON 已修复（内置兜底）")
+            return out
+    except Exception:
+        pass
+    return {}
+
+
 def _safe_json(raw: str) -> dict:
-    """工具参数 JSON 解析（失败给空 dict）"""
+    """工具参数 JSON 解析：严格失败再尝试修复，仍失败才给空 dict。"""
     if not raw:
         return {}
+    if isinstance(raw, dict):
+        return raw
     try:
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
-        return {}
+        return _repair_json(raw)
 
 
 # 网页类工具：抓回的内容可能夹带「忽略之前的设定」这类指令，回灌模型时套上数据边界
@@ -2468,6 +2514,8 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
 
     def _long_memory_block(self, user_input: str) -> str:
         """召回与这句话相关的旧事，拼成本轮的注入块。任何异常都返回空。"""
+        # 先清空：本轮无论召回成功与否，都不要沿用上一轮的 id（否则确认/异议会记错条目）
+        self._last_recall_ids = []
         if not _setting_bool("memory_long_term", True):
             return ""
         try:
@@ -2475,17 +2523,16 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         except Exception:
             return ""
         _st = {}
+        _guest = "group" in str(self._memory_key()).lower()
         try:
             _mood = self._mood if _setting_bool("mood_enabled", True) else 0
             hits = _ms.recall(user_input, k=int(getattr(self, "_recall_k", 4) or 4),
-                              mood=_mood, stats=_st,
+                              mood=_mood, stats=_st, guest=_guest,
                               focus=list((getattr(self, "_mem_entities", {}) or {}).values()))
-            # 留给下一轮判断"用户是不是在否认这条记忆"（异议计数用）
-            self._last_recall_ids = [h.get("id") for h in hits if h.get("id")]
-            if _st.get("boosted") or _st.get("suppressed") or _st.get("banned"):
+            if _st.get("boosted") or _st.get("suppressed") or _st.get("banned") or _st.get("dropped"):
                 print(f"[记忆] 召回 {_st.get('count', 0)} 条（情绪加权 "
                       f"+{_st.get('boosted', 0)}/-{_st.get('suppressed', 0)}，"
-                      f"禁提跳过 {_st.get('banned', 0)}）")
+                      f"禁提跳过 {_st.get('banned', 0)}，闸门丢弃 {_st.get('dropped', 0)}）")
         except Exception as _e:
             print(f"[记忆] 召回失败（忽略）: {str(_e)[:60]}")
             hits = []
@@ -2500,19 +2547,16 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
             _dir_block = ""
         if not hits and not summary and not _dir_block:
             return ""
-        parts = []
-        if _dir_block:
-            parts.append(_dir_block)
-        parts.append(
-            "【你还记得的事】（这些是用户亲口说过的，不是设定、不是剧情。"
-            "聊天里自然提到就行，别列成清单，别当成别人的故事）"
+        try:
+            _last_ids = [h.get("id") for h in hits if h.get("id")
+                         and h.get("use_mode") in (None, "explicit", "ask")
+                         and h.get("speaker") != "assistant"]
+        except Exception:
+            _last_ids = []
+        self._last_recall_ids = _last_ids
+        return _ms.render_memory_block(
+            hits, summary, _dir_block, cap=int(getattr(self, "_MEMORY_INJECT_CAP", 520) or 520)
         )
-        for h in hits:
-            _past = "（以前的说法，现在可能已经改了）" if h.get("valid_to") else ""
-            parts.append(f"- {h.get('date', '')} {_past}{h.get('text', '')}")
-        if summary:
-            parts.append("【你们之前聊到过】\n" + summary)
-        return "\n".join(parts)[: self._MEMORY_INJECT_CAP]
 
     def _memory_extract_once(self, messages: list, timeout: float = 40) -> str:
         """会话安静下来后抽取一次情节：单次非流式调用，失败静默、不重试。"""
@@ -2592,10 +2636,49 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
             return
         threading.Thread(target=self._flush_memory_worker, args=(msgs,), daemon=True).start()
 
+    def _capture_promises(self, msgs: list):
+        """她说出口的承诺单独记一条：防止"我上次不是答应过"变成编造。"""
+        try:
+            import memory_store as _ms
+        except Exception:
+            return
+        for m in msgs:
+            if m.get("role") != "assistant":
+                continue
+            for sent in re.split(r"[。！？!?\n]", m.get("content") or ""):
+                s = sent.strip(" ，,、")
+                if not s or len(s) > 40 or not _PROMISE_RE.search(s):
+                    continue
+                if _ms.add_episode(s, "promise", importance=3, extra={"speaker": "assistant"}):
+                    print(f"[记忆] 记下自己的承诺：{s[:20]}")
+
+    def _should_extract_memory(self, msgs: list) -> bool:
+        """复现门控：同一主题第二次出现才值得抽取，高显著内容直接放行。"""
+        try:
+            if not _setting_bool("memory_recurrence_gate", True):
+                return True
+            import memory_store as _ms
+            user_text = " ".join((m.get("content") or "") for m in msgs
+                                 if m.get("role") == "user")
+            if _MEM_SALIENT_RE.search(user_text):
+                return True
+            if _ms.episode_count() < 20:
+                return True          # 冷启动先用一段时间把底子铺起来
+            r = _ms.recurrence(user_text)
+            if r >= 0.18:        # 同主题换种说法大约在 0.2 上下，阈值再高会误杀
+                return True
+            print(f"[记忆] 主题复现度 {r:.2f}，本轮不抽取（省一次调用）")
+            return False
+        except Exception:
+            return True
+
     def _flush_memory_worker(self, msgs: list, timeout: float = 40):
         try:
             import memory_store as _ms
         except Exception:
+            return
+        self._capture_promises(msgs)
+        if not self._should_extract_memory(msgs):
             return
         items = _ms.parse_extraction(self._memory_extract_once(msgs, timeout))[:6]
         added = 0
