@@ -1636,8 +1636,7 @@ function refreshServices() {
             item.className = 'service-item';
             const stateClass = ['running', 'starting', 'failed'].includes(s.state) ? s.state : 'stopped';
             const stateText = { running: '运行中', stopped: '已停止', starting: '启动中', failed: '失败' }[s.state] || s.state;
-            const btnLabel = s.state === 'running' ? '停止'
-                : s.state === 'starting' ? '启动中'
+            const btnLabel = s.state === 'running' || s.state === 'starting' ? '停止'
                 : s.state === 'failed' ? '重试' : '启动';
             item.innerHTML = `
                 <div class="svc-info">
@@ -1646,8 +1645,7 @@ function refreshServices() {
                 </div>
                 <div class="svc-actions">
                     <span class="svc-status ${stateClass}">${_escapeHTML(stateText)}</span>
-                    <button class="svc-btn" data-name="${_escapeHTML(s.name)}" data-action="${s.state === 'running' ? 'stop' : 'start'}"
-                        ${s.state === 'starting' ? 'disabled' : ''}>${btnLabel}</button>
+                    <button class="svc-btn" data-name="${_escapeHTML(s.name)}" data-action="${s.state === 'running' || s.state === 'starting' ? 'stop' : 'start'}">${btnLabel}</button>
                 </div>`;
             container.appendChild(item);
         });
