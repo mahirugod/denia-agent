@@ -144,6 +144,20 @@ _PROMISE_RE = re.compile(
     r"|我(?:等会|待会儿?|明天|晚点|回头)?(?:再)?(?:帮你|给你|提醒你|告诉你|发你)"
 )
 
+# 实体抽取的噪声词：这些开头的是句子成分，不是名字或话题
+# （"我是想查天津"曾把"想查天津"记成称呼，"看起来还不错"曾把"起来还不错"记成在找的东西）
+_ENTITY_BAD_HEAD = (
+    "想", "要", "去", "在", "不", "没", "别", "你", "我", "他", "她", "它",
+    "这", "那", "什么", "谁", "哪", "几", "怎么", "为什么", "查", "找", "看",
+    "听", "玩", "说", "问", "帮", "给", "起来", "出来", "上去", "下去", "过来",
+)
+# 身份词不是名字："我是学生"不该把"学生"当称呼
+_ENTITY_ROLE_WORDS = (
+    "学生", "老师", "男生", "女生", "上班族", "社畜", "程序员", "工程师", "医生",
+    "护士", "新人", "小白", "大一", "大二", "大三", "大四", "研究生", "硕士",
+    "博士", "高中生", "初中生", "打工人",
+)
+
 
 def cleanup_stale_history(active_file: str = ""):
     """归档长期未使用的会话历史（每个进程只跑一次）
@@ -2239,25 +2253,59 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                 self._extract_entities(m.get("content", ""))
         self._rolling_count = 0
 
+    @staticmethod
+    def _clean_entity_value(value: str, max_len: int = 10) -> str:
+        """去掉明显不是实体的抽取结果（句子成分、语气词、过长片段）"""
+        v = (value or "").strip(" 　，。！？!?、,.~～")
+        if not v or len(v) > max_len:
+            return ""
+        if v.startswith(_ENTITY_BAD_HEAD):
+            return ""
+        return v
+
+    def _sanitize_entities(self):
+        """清掉历史里存下来的坏实体（旧规则把"想查天津"记成称呼这类）"""
+        limits = {"我的称呼": 4, "地名": 6, "待办": 16}
+        for k in list(self._mem_entities.keys()):
+            v = self._clean_entity_value(str(self._mem_entities.get(k) or ""),
+                                         limits.get(k, 10))
+            if not v or (k == "我的称呼" and v in _ENTITY_ROLE_WORDS):
+                self._mem_entities.pop(k, None)
+            elif v != self._mem_entities.get(k):
+                self._mem_entities[k] = v
+
     def _extract_entities(self, user_text: str):
         """C：纯规则抽取稳定事实（称呼/偏好/正在做的事/地名/时间），不耗模型，
         存入 _mem_entities（去重，最多 12 条，FIFO）。"""
         import re as _re
 
         text = user_text
-        # 称呼/人名：「我叫X」「我是X」「我是X人」「X姐/哥/老师」
-        m = _re.search(r"我(?:叫|是)([\u4e00-\u9fa5]{2,4})", text)
+        # 称呼：「我叫X」「叫我X」——要求后面紧跟标点/语气词，避免
+        # "我叫你查一下…"被截成名字；不再认"我是X"（"我是想查天津"会误判）
+        m = _re.search(
+            r"我(?:叫|名字叫)([\u4e00-\u9fa5A-Za-z]{1,4}?)"
+            r"(?=[呀啊哦呢啦~～，。！？!?,\s]|$)", text)
         if m:
-            self._mem_entities.setdefault("我的称呼", m.group(1))
+            name = self._clean_entity_value(m.group(1), 4)
+            if name and name not in _ENTITY_ROLE_WORDS:
+                self._mem_entities.setdefault("我的称呼", name)
         # 偏好：「我喜欢X」「我不喜欢X」「我讨厌X」——否定式要单独记，别归一成喜欢
-        m = _re.search(r"我(?:最|很|超|挺)?(不喜欢|讨厌|喜欢|爱|偏爱)([\u4e00-\u9fa5\w]{2,10})", text)
+        m = _re.search(
+            r"我(?:最|很|超|挺)?(不喜欢|讨厌|喜欢|爱|偏爱)"
+            r"([\u4e00-\u9fa5\w]{2,10}?)(?=[，。！？!?\s]|$)", text)
         if m:
-            key = "我不喜欢" if m.group(1) in ("不喜欢", "讨厌") else "我喜欢"
-            self._mem_entities.setdefault(key, m.group(2))
+            val = self._clean_entity_value(m.group(2))
+            if val:
+                key = "我不喜欢" if m.group(1) in ("不喜欢", "讨厌") else "我喜欢"
+                self._mem_entities.setdefault(key, val)
         # 正在做的事：「我最近在X」「我现在在X」「我这几天在忙X」
-        m = _re.search(r"我(?:最近|现在|这几天|这阵子)(?:正在|在|忙着|都在)?([\u4e00-\u9fa5\w]{2,12})", text)
+        m = _re.search(
+            r"我(?:最近|现在|这几天|这阵子)(?:正在|在|忙着|都在)?"
+            r"([\u4e00-\u9fa5\w]{2,12}?)(?=[，。！？!?\s]|$)", text)
         if m:
-            self._set_entity("我最近", m.group(1), mutable=True)
+            val = self._clean_entity_value(m.group(1), 12)
+            if val:
+                self._set_entity("我最近", val, mutable=True)
         # 游戏名（小模型易错，固定词表）
         for g in ["鸣潮", "原神", "崩坏", "崩铁", "星穹", "王者荣耀", "明日方舟", "库洛"]:
             if g in text or g in text.replace("庫", "库").replace("潮", "潮"):
@@ -2266,14 +2314,28 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
         m = _re.search(r"(?:去|到|在)([\u4e00-\u9fa5]{2,4}(?:市|县|区|省))", text)
         if m:
             self._mem_entities.setdefault("地名", m.group(1))
-        # 歌曲/影视/音乐：「喜欢X」「听X」「看X」「播放X」
-        m = _re.search(r"(?:喜欢|听|看|播放|搜)([\u4e00-\u9fa5\w]{2,10})[，。？！\s]", text)
+        # 在找的东西：只认「找/搜」这类明确动作。
+        # 原来的「喜欢/听/看/播放」太宽，"看起来还不错"会把"起来还不错"记成在找
+        m = _re.search(
+            r"我(?:最近|现在)?(?:在|想|要)?找(?:一个|一款|一下|个|款|点)?"
+            r"([\u4e00-\u9fa5\w]{2,10}?)(?=[，。！？!?\s]|$)", text)
         if m:
-            self._mem_entities.setdefault("我在找", m.group(1))
+            val = self._clean_entity_value(m.group(1))
+            if val:
+                self._set_entity("我在找", val, mutable=True)
+        # 查/搜里只认「搜」：查询天气这类一次性问题不该变成"我在找"的长期记忆
+        m = _re.search(
+            r"(?:帮我|给我|麻烦你?)?(?:搜|搜索)(?:一下|下|一个|一款)?"
+            r"([\u4e00-\u9fa5\w]{2,10}?)(?=[，。！？!?\s]|$)", text)
+        if m:
+            val = self._clean_entity_value(m.group(1))
+            if val:
+                self._set_entity("我在找", val, mutable=True)
         # 时间承诺：「X分钟/小时后提醒我Y」
         m = _re.search(r"(\d+)\s*(分钟|小时|秒|天|个?月)之后提醒我(\S{1,6})", text)
         if m:
             self._mem_entities["待办"] = f"{m.group(1)}{m.group(2)}提醒{m.group(3)}"
+        self._sanitize_entities()
         # FIFO：超过 12 条丢最旧的
         if len(self._mem_entities) > 12:
             # 保留"稳定事实"优先，丢其余最早插入的
@@ -2752,6 +2814,7 @@ web_search 只在问外部世界事实（天气、新闻、游戏、人物、商
                         ]
                         self._rolling_summary = data.get("summary", "")
                         self._mem_entities = data.get("entities", {}) or {}
+                        self._sanitize_entities()  # 顺便清掉旧规则留下的坏实体
                     elif isinstance(data, list) and len(data) > 0:
                         self.conversation_history = data[-self._history_count_cap() :]
                     print(f"[LLM] 加载聊天历史: {len(self.conversation_history)} 条")
